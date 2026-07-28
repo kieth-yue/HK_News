@@ -9,11 +9,13 @@ from datetime import datetime, timedelta, timezone
 # 讀取環境變數（沿用舊Secret名 YAHOO_RSS）
 YAHOO_RSS_BASE = os.environ["YAHOO_RSS"]
 
-# 全局請求頭
+# 全局請求頭【升級仿真瀏覽器UA，改善被封問題】
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; PersonalStockMonitor/1.0; RSS Feed Reader; Non-commercial personal use)",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Accept-Language": "zh-HK,zh;q=0.9,en;q=0.8",
-    "Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8"
+    "Accept": "application/rss+xml,application/xml;q=0.9,text/xml,*/*;q=0.8",
+    "Referer": "https://finance.yahoo.com/",
+    "Cache-Control": "no-cache"
 }
 
 NEGATIVE_HINT_ZH = ["盈警", "虧損", "預虧", "業績倒退", "純利跌", "減持", "配股", "供股", "抽水", "攤薄", "批股", "處罰", "罰款", "召回", "制裁", "破產", "清盤", "除牌", "停牌", "調查", "起訴", "訴訟", "造假", "欺詐", "暴跌", "大跌", "下調", "降級"]
