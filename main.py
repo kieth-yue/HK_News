@@ -11,11 +11,22 @@ def main():
     with open("config.yaml", "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     
-    stock_pool_raw = os.environ["STOCK_POOL"]
-    stock_list = json.loads(stock_pool_raw)
-    FEISHU_WEBHOOK = os.environ["FEISHU_WEBHOOK"]
-    # 替換為SiliconFlow金鑰
-    SILICONFLOW_API_KEY = os.environ["SILICONFLOW_API_KEY"]
+    stock_pool_raw = os.environ.get("STOCK_POOL")
+    if not stock_pool_raw:
+        print("❌ 錯誤：環境變數 STOCK_POOL 不存在")
+        return
+        
+    # 重點修復：先解析為dict，再提取stock_pool數組
+    data = json.loads(stock_pool_raw)
+    stock_list = data["stock_pool"]
+    
+    # Debug 偵測日誌，測試完可以註釋掉
+    print(f"[DEBUG] stock_list 類型: {type(stock_list)}")
+    if isinstance(stock_list, list) and len(stock_list) > 0:
+        print(f"[DEBUG] 第一隻股票類型: {type(stock_list[0])}")
+
+    FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK")
+    SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY")
 
     cache_file = config["cache_file"]
     cache_set = set()
@@ -47,7 +58,6 @@ def main():
     print("="*50)
     print("開始AI智能分析")
     print("="*50)
-    # 參數替換為SiliconFlow Key
     valid_bullish = analyze_news_batch(match_news, all_raw_news, SILICONFLOW_API_KEY, config["bullish_min_score"])
 
     push_list = []
