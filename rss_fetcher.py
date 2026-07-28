@@ -6,8 +6,8 @@ import re
 import os
 from datetime import datetime, timedelta, timezone
 
-# 讀取環境變數（模仿舊 GOOGLE_NEWS_RSS_BASE 做法）
-YAHOO_RSS_BASE = os.environ["YAHOO_RSS_BASE"]
+# 讀取環境變數（沿用舊Secret名 YAHOO_RSS）
+YAHOO_RSS_BASE = os.environ["YAHOO_RSS"]
 
 # 全局請求頭
 HEADERS = {
