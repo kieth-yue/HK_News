@@ -7,6 +7,9 @@ import urllib.parse
 import os
 from datetime import datetime, timedelta, timezone
 
+# 讀取環境變數（模仿舊 GOOGLE_NEWS_RSS_BASE 做法）
+YAHOO_RSS_BASE = os.environ["YAHOO_RSS_BASE"]
+
 # 全局請求頭
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; PersonalStockMonitor/1.0; RSS Feed Reader; Non-commercial personal use)",
@@ -117,8 +120,8 @@ def _fetch_single_rss(url, source_name):
 
 def fetch_yahoo_rss(stock):
     query = _build_yahoo_rss_query(stock)
-    # Yahoo Finance RSS 搜尋接口
-    url = f"https://search.yahoo.com/rss?query={query}"
+    # 基礎URL由環境變數讀取，模仿舊Google News寫法
+    url = f"{YAHOO_RSS_BASE}{query}&hl=zh-HK&gl=HK&ceid=HK:zh-HK"
     return _fetch_single_rss(url, "Yahoo RSS")
 
 def fetch_all_stock_rss(stock_list, config=None):
