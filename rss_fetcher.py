@@ -3,7 +3,6 @@ import feedparser
 import time
 import random
 import re
-import urllib.parse
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -83,18 +82,12 @@ def _generate_match_keywords(stock):
                 keywords_zh.add(alias)
     return {"code_pattern": code_pattern, "zh": list(keywords_zh), "en": list(keywords_en)}
 
-def _build_yahoo_rss_query(stock):
-    """構建Yahoo Finance RSS查詢（港股搜尋）"""
+# 轉換股票代碼：HK.00700 → 00700.HK
+def _build_yahoo_symbol(stock):
     code = stock["code"]
-    name = stock["name"]
     pure_code = code.replace("HK.", "").replace("hk.", "").strip()
-    # Yahoo RSS 搜尋關鍵詞
-    query_parts = [f"{pure_code}.HK", f'"{name}"']
-    if pure_code in STOCK_ALIAS:
-        for alias in STOCK_ALIAS[pure_code]:
-            query_parts.append(f'"{alias}"')
-    query = " OR ".join(query_parts) + " Hong Kong stock news"
-    return urllib.parse.quote(query)
+    yahoo_symbol = f"{pure_code}.HK"
+    return yahoo_symbol
 
 def _fetch_single_rss(url, source_name):
     news_list = []
@@ -119,9 +112,9 @@ def _fetch_single_rss(url, source_name):
     return news_list
 
 def fetch_yahoo_rss(stock):
-    query = _build_yahoo_rss_query(stock)
-    # 基礎URL由環境變數讀取，模仿舊Google News寫法
-    url = f"{YAHOO_RSS_BASE}{query}&hl=zh-HK&gl=HK&ceid=HK:zh-HK"
+    symbol = _build_yahoo_symbol(stock)
+    # 拼接完整URL，對應 feeds.finance.yahoo.com 個股RSS
+    url = f"{YAHOO_RSS_BASE}{symbol}&region=HK&lang=zh-Hant-HK"
     return _fetch_single_rss(url, "Yahoo RSS")
 
 def fetch_all_stock_rss(stock_list, config=None):
