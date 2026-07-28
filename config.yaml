@@ -1,0 +1,23 @@
+# ========== 掃描速度配置（Yahoo RSS 專用，適度放慢避免封IP）
+scan_random_delay_max: 180         # 開頭隨機等待0-3分鐘錯峰
+per_request_sleep_min: 0.8         # 單RSS請求最小休眠0.8秒
+per_request_sleep_max: 1.5         # 單RSS請求最大休眠1.5秒
+crawl_batch_size: 10               # 每批爬10隻股票
+batch_sleep_min: 2                 # 每批爬完最小等待2秒
+batch_sleep_max: 5                 # 每批爬完最大等待5秒
+news_valid_hour: 48                # 僅抓取最近48小時新聞
+
+# ========== AI過濾配置（完全沿用舊規則不變）
+bullish_min_score: 88              # 利好分數門檻
+filter_one_time_profit: true       # 過濾一次性收益
+filter_mou_intent: true            # 過濾無約束力意向書
+ai_batch_size: 35                  # AI每35條批量分析
+ai_retry_count: 3                  # 重試次數
+
+# ========== 數據源開關【僅開啟 Yahoo RSS】
+enable_yahoo_rss: true
+
+# ========== 推送去重緩存配置（維持原有邏輯）
+enable_push_cache: true
+cache_expire_hour: 48
+cache_file: "./push_cache.json"
