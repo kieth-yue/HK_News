@@ -50,7 +50,7 @@ def _clean_html(raw_text):
     clean = clean.replace("Read more", "").replace("閱讀更多", "").replace("繼續閱讀", "").replace("...", "").strip()
     return clean[:500]
 
-def _sleep(min_t=0.8, max_t=1.5):
+def _sleep(min_t=1.2, max_t=2.2):
     time.sleep(random.uniform(min_t, max_t))
 
 def _parse_publish_time(entry):
