@@ -34,6 +34,7 @@ jobs:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
           STOCK_POOL: ${{ secrets.STOCK_POOL }}
+          YAHOO_RSS: ${{ secrets.YAHOO_RSS }}
         run: python main.py
       - name: 保存推送緩存
         uses: actions/cache@v4
