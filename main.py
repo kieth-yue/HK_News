@@ -3,6 +3,9 @@ import json
 import time
 import random
 import re
+import base64
+import hashlib
+import hmac
 from datetime import datetime, timedelta
 import google.generativeai as genai
 import requests
@@ -16,12 +19,78 @@ CACHE_FILE = "push_cache.json"
 LOCK_FILE = "run.lock"
 MODEL_NAME = "gemini-2.5-flash"
 
+# ========== 飛書推送 ==========
+def gen_feishu_sign(timestamp: str, secret: str) -> str:
+    """飛書自定義機械人簽名校驗"""
+    string_to_sign = f"{timestamp}\n{secret}"
+    hmac_code = hmac.new(
+        string_to_sign.encode("utf-8"),
+        digestmod=hashlib.sha256
+    ).digest()
+    return base64.b64encode(hmac_code).decode("utf-8")
+
+def send_feishu(raw_text: str) -> int:
+    """
+    發送飛書 interactive 卡片。
+    - 如果設咗 FEISHU_SECRET 就自動加簽名；
+    - 冇設就直接用 webhook 發送。
+    - 失敗自動重試 2 次。
+    """
+    hkt_now = get_hkt_now()
+    time_str = hkt_now.strftime("%Y-%m-%d %H:%M HKT")
+
+    payload = {
+        "msg_type": "interactive",
+        "card": {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "📊 港股新聞監控快訊"},
+                "template": "red"
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": raw_text}
+                },
+                {"tag": "hr"},
+                {
+                    "tag": "note",
+                    "elements": [
+                        {"tag": "plain_text", "content": f"⏰ 推送時間：{time_str}"}
+                    ]
+                }
+            ]
+        }
+    }
+
+    # 簽名校驗（可選）
+    if FEISHU_SECRET:
+        ts = str(int(time.time()))
+        payload["timestamp"] = ts
+        payload["sign"] = gen_feishu_sign(ts, FEISHU_SECRET)
+
+    # 重試機制
+    for attempt in range(3):
+        try:
+            r = requests.post(FEISHU_WEBHOOK, json=payload, timeout=30)
+            resp = r.json()
+            if r.status_code == 200 and resp.get("code", 0) == 0:
+                print(f"飛書推送成功 (attempt {attempt+1})")
+                return 200
+            else:
+                print(f"飛書推送失敗: status={r.status_code}, resp={resp}")
+        except Exception as e:
+            print(f"飛書推送異常 (attempt {attempt+1}): {e}")
+        if attempt < 2:
+            time.sleep(3)
+    return -1
+
+# ========== 時間 / 鎖 / 緩存 ==========
 def get_hkt_now() -> datetime:
     return datetime.utcnow() + timedelta(hours=8)
 
 def is_weekend() -> bool:
-    now = get_hkt_now()
-    return now.weekday() >= 5
+    return get_hkt_now().weekday() >= 5
 
 def load_cache():
     if not os.path.exists(CACHE_FILE):
@@ -74,6 +143,7 @@ def is_long_run_time_over():
         return True
     return False
 
+# ========== Gemini ==========
 def gemini_call(prompt: str):
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel(
@@ -84,17 +154,6 @@ def gemini_call(prompt: str):
     resp = model.generate_content(prompt)
     return resp.text
 
-def send_feishu(raw_text: str):
-    payload = {
-        "msg_type": "interactive",
-        "card": {
-            "config": {"wide_screen_mode": True},
-            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": raw_text}}]
-        }
-    }
-    r = requests.post(FEISHU_WEBHOOK, json=payload, timeout=30)
-    return r.status_code
-
 def parse_extract_keys(gemini_output: str):
     stock_pattern = re.compile(r"🏷️ 股票：.*?(\d+\.HK)", re.DOTALL)
     title_pattern = re.compile(r"📰 新聞標題：(.*?)\n", re.DOTALL)
@@ -103,23 +162,17 @@ def parse_extract_keys(gemini_output: str):
     return titles, stock_codes
 
 def scan_once(include_macro: bool = True):
-    """
-    執行一次掃描。
-    include_macro=True  → 完整 prompt（板塊+個股），用於 job 第一輪 / one-shot
-    include_macro=False → 追加指令只輸出個股，節省 token，用於長駐後續輪次
-    """
     cache = load_cache()
     pushed_set = set(cache.get("pushed", []))
 
-    # 構建本輪 prompt
     if include_macro:
         prompt = SYSTEM_PROMPT
     else:
         prompt = (
-                            SYSTEM_PROMPT
-                            + "\n\n【重要補充指令】今次掃描**只需要輸出「=== 【個股重大利好】 ===」部分**，"
-                            "**唔好輸出「=== 【板塊宏觀消息】 ===」區塊**，板塊宏觀消息已經喺本次啟動第一輪掃描過，唔使重複。"
-                        )
+            SYSTEM_PROMPT
+            + "\n\n【重要補充指令】今次掃描**只需要輸出「=== 【個股重大利好】 ===」部分**，"
+              "**唔好輸出「=== 【板塊宏觀消息】 ===」區塊**，板塊宏觀消息已經喺本次啟動第一輪掃描過，唔使重複。"
+        )
 
     llm_result = gemini_call(prompt)
     print("=== Gemini output ===")
@@ -145,7 +198,7 @@ def scan_once(include_macro: bool = True):
     macro_block_text = "\n".join(block_macro).strip()
     stock_block_text = "\n".join(block_stock).strip()
 
-    # 個股逐條過濾已推送紀錄
+    # 個股去重
     filtered_stock_lines = []
     stock_lines_all = stock_block_text.split("\n")
     idx_title = 0
@@ -167,7 +220,6 @@ def scan_once(include_macro: bool = True):
 
     final_stock_text = "\n".join(filtered_stock_lines).strip()
 
-    # 組裝輸出：只有 include_macro 先輸出板塊區塊
     final_out = []
     if include_macro:
         final_out.append("=== 【板塊宏觀消息】 ===")
@@ -181,6 +233,7 @@ def scan_once(include_macro: bool = True):
     cache["pushed"] = list(pushed_set)
     save_cache(cache)
 
+# ========== 主流程 ==========
 def main():
     hkt_now = get_hkt_now()
     print(f"HKT now:{hkt_now.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -212,7 +265,6 @@ def main():
                     print("已到長駐結束時間，退出迴圈，job完結")
                     break
                 try:
-                    # 第一輪 include_macro=True，之後全部 False
                     scan_once(include_macro=first_round)
                     first_round = False
                 except Exception as e:
