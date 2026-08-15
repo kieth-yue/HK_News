@@ -40,6 +40,7 @@ def gen_feishu_sign(timestamp: str, secret: str) -> str:
 
 def send_feishu(raw_text: str) -> int:
     hkt_now = get_hkt_now()
+    date_str = hkt_now.strftime("%Y-%m-%d")
     time_str = hkt_now.strftime("%Y-%m-%d %H:%M HKT")
 
     payload = {
@@ -47,8 +48,8 @@ def send_feishu(raw_text: str) -> int:
         "card": {
             "config": {"wide_screen_mode": True},
             "header": {
-                "title": {"tag": "plain_text", "content": "📊 港股新聞監控快訊"},
-                "template": "red"
+                "title": {"tag": "plain_text", "content": f"📊 港股新聞監控快訊 | {date_str}"},
+                "template": "wathet"
             },
             "elements": [
                 {
@@ -94,20 +95,8 @@ def format_links(text: str) -> str:
         if urls:
             return f"🔗 連結：[點擊查看]({urls[0]})"
         return m.group(0)
-    # 匹配 🔗 連結： 到下一個 emoji 行 / 區塊標題 / 字串結尾
     pattern = r'🔗 連結：[\s\S]*?(?=\n[💡🏷️📰⏰📌]|\n===|\Z)'
     return re.sub(pattern, replacer, text)
-
-def should_skip_macro(macro_text: str) -> bool:
-    """板塊區塊如果表示無符合條件，就跳過唔顯示"""
-    skip_keywords = [
-        "無符合條件", "冇符合條件", "无符合条件",
-        "沒有符合條件", "没有符合条件", "冇符合", "無符合"
-    ]
-    for kw in skip_keywords:
-        if kw in macro_text:
-            return True
-    return False
 
 # ========== 時間 / 鎖 / 緩存 ==========
 def get_hkt_now() -> datetime:
@@ -205,6 +194,11 @@ def scan_once(include_macro: bool = True):
     print("=== Gemini output ===")
     print(llm_result)
 
+    # 如果 Gemini 直接回「無符合條件」且冇任何新聞標題，就唔使推送
+    if "📰" not in llm_result:
+        print("當前時段無符合條件之重大消息，唔推送飛書")
+        return
+
     titles, stock_codes = parse_extract_keys(llm_result)
     lines = llm_result.splitlines()
     block_macro = []
@@ -247,19 +241,25 @@ def scan_once(include_macro: bool = True):
 
     final_stock_text = "\n".join(filtered_stock_lines).strip()
 
+    # 判斷邊個區塊有實質新聞（包含 📰 先算有）
+    macro_has_news = "📰" in macro_block_text
+    stock_has_news = "📰" in final_stock_text
+
+    if not macro_has_news and not stock_has_news:
+        print("篩選後無實質新聞內容，唔推送飛書")
+        return
+
     # 組裝輸出
     final_out = []
-    if include_macro and not should_skip_macro(macro_block_text):
+    if include_macro and macro_has_news:
         final_out.append("=== 【板塊宏觀消息】 ===")
         final_out.append(macro_block_text)
-    final_out.append("=== 【個股重大利好】 ===")
-    final_out.append(final_stock_text)
+    if stock_has_news:
+        final_out.append("=== 【個股重大利好】 ===")
+        final_out.append(final_stock_text)
 
     final_text = "\n".join(final_out)
-
-    # 連結後處理：超長 URL → 短連結，一行顯示
     final_text = format_links(final_text)
-
     send_feishu(final_text)
 
     cache["pushed"] = list(pushed_set)
