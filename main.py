@@ -10,18 +10,26 @@ from datetime import datetime, timedelta
 import google.generativeai as genai
 import requests
 
-# ========== 讀取 Secrets 環境變數 ==========
+# ========== 讀取 Secrets / Variables 環境變數 ==========
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK")
+FEISHU_SECRET = os.getenv("FEISHU_SECRET", "")
 SYSTEM_PROMPT = os.getenv("HK_NEWS_PROMPT", "")
 
 CACHE_FILE = "push_cache.json"
 LOCK_FILE = "run.lock"
 MODEL_NAME = "gemini-2.5-flash"
 
+# ========== Gemini 全局初始化（只做一次，不扣 token）==========
+genai.configure(api_key=GEMINI_API_KEY)
+GEMINI_MODEL = genai.GenerativeModel(
+    MODEL_NAME,
+    generation_config={"temperature": 0.1},
+    tools=[{"google_search": {}}]
+)
+
 # ========== 飛書推送 ==========
 def gen_feishu_sign(timestamp: str, secret: str) -> str:
-    """飛書自定義機械人簽名校驗"""
     string_to_sign = f"{timestamp}\n{secret}"
     hmac_code = hmac.new(
         string_to_sign.encode("utf-8"),
@@ -30,12 +38,6 @@ def gen_feishu_sign(timestamp: str, secret: str) -> str:
     return base64.b64encode(hmac_code).decode("utf-8")
 
 def send_feishu(raw_text: str) -> int:
-    """
-    發送飛書 interactive 卡片。
-    - 如果設咗 FEISHU_SECRET 就自動加簽名；
-    - 冇設就直接用 webhook 發送。
-    - 失敗自動重試 2 次。
-    """
     hkt_now = get_hkt_now()
     time_str = hkt_now.strftime("%Y-%m-%d %H:%M HKT")
 
@@ -63,13 +65,11 @@ def send_feishu(raw_text: str) -> int:
         }
     }
 
-    # 簽名校驗（可選）
     if FEISHU_SECRET:
         ts = str(int(time.time()))
         payload["timestamp"] = ts
         payload["sign"] = gen_feishu_sign(ts, FEISHU_SECRET)
 
-    # 重試機制
     for attempt in range(3):
         try:
             r = requests.post(FEISHU_WEBHOOK, json=payload, timeout=30)
@@ -143,15 +143,9 @@ def is_long_run_time_over():
         return True
     return False
 
-# ========== Gemini ==========
+# ========== Gemini 調用（唯一扣 token 嘅地方）==========
 def gemini_call(prompt: str):
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(
-        MODEL_NAME,
-        generation_config={"temperature": 0.1},
-        tools=[{"google_search": {}}]
-    )
-    resp = model.generate_content(prompt)
+    resp = GEMINI_MODEL.generate_content(prompt)
     return resp.text
 
 def parse_extract_keys(gemini_output: str):
@@ -198,7 +192,6 @@ def scan_once(include_macro: bool = True):
     macro_block_text = "\n".join(block_macro).strip()
     stock_block_text = "\n".join(block_stock).strip()
 
-    # 個股去重
     filtered_stock_lines = []
     stock_lines_all = stock_block_text.split("\n")
     idx_title = 0
