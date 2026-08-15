@@ -59,9 +59,9 @@ def get_run_mode():
     h, m = hkt.hour, hkt.minute
     if 8 <= h < 10:
         return "long_run"
-    if (h == 11) or (h == 12) or (h ==13 and m <=30):
+    if (h == 11) or (h == 12) or (h == 13 and m <= 30):
         return "long_run"
-    if (h ==15 and m ==0) or (h ==15 and m ==50) or (h ==22 and m ==0):
+    if (h == 15 and m == 0) or (h == 15 and m == 50) or (h == 22 and m == 0):
         return "one_shot"
     return "none"
 
@@ -70,7 +70,7 @@ def is_long_run_time_over():
     h, m = hkt.hour, hkt.minute
     if h >= 10:
         return True
-    if h >=14 or (h ==13 and m >30):
+    if h >= 14 or (h == 13 and m > 30):
         return True
     return False
 
@@ -102,11 +102,26 @@ def parse_extract_keys(gemini_output: str):
     stock_codes = stock_pattern.findall(gemini_output)
     return titles, stock_codes
 
-def scan_once():
+def scan_once(include_macro: bool = True):
+    """
+    執行一次掃描。
+    include_macro=True  → 完整 prompt（板塊+個股），用於 job 第一輪 / one-shot
+    include_macro=False → 追加指令只輸出個股，節省 token，用於長駐後續輪次
+    """
     cache = load_cache()
     pushed_set = set(cache.get("pushed", []))
 
-    llm_result = gemini_call(SYSTEM_PROMPT)
+    # 構建本輪 prompt
+    if include_macro:
+        prompt = SYSTEM_PROMPT
+    else:
+        prompt = (
+                            SYSTEM_PROMPT
+                            + "\n\n【重要補充指令】今次掃描**只需要輸出「=== 【個股重大利好】 ===」部分**，"
+                            "**唔好輸出「=== 【板塊宏觀消息】 ===」區塊**，板塊宏觀消息已經喺本次啟動第一輪掃描過，唔使重複。"
+                        )
+
+    llm_result = gemini_call(prompt)
     print("=== Gemini output ===")
     print(llm_result)
 
@@ -130,6 +145,7 @@ def scan_once():
     macro_block_text = "\n".join(block_macro).strip()
     stock_block_text = "\n".join(block_stock).strip()
 
+    # 個股逐條過濾已推送紀錄
     filtered_stock_lines = []
     stock_lines_all = stock_block_text.split("\n")
     idx_title = 0
@@ -151,12 +167,14 @@ def scan_once():
 
     final_stock_text = "\n".join(filtered_stock_lines).strip()
 
-    final_out = [
-        "=== 【板塊宏觀消息】 ===",
-        macro_block_text,
-        "=== 【個股重大利好】 ===",
-        final_stock_text
-    ]
+    # 組裝輸出：只有 include_macro 先輸出板塊區塊
+    final_out = []
+    if include_macro:
+        final_out.append("=== 【板塊宏觀消息】 ===")
+        final_out.append(macro_block_text)
+    final_out.append("=== 【個股重大利好】 ===")
+    final_out.append(final_stock_text)
+
     final_text = "\n".join(final_out)
     send_feishu(final_text)
 
@@ -165,7 +183,7 @@ def scan_once():
 
 def main():
     hkt_now = get_hkt_now()
-    print(f"HKT now:{hkt_now.strftime('%Y‑%m‑%d %H:%M:%S')}")
+    print(f"HKT now:{hkt_now.strftime('%Y-%m-%d %H:%M:%S')}")
 
     if is_weekend():
         print("週末，退出")
@@ -183,21 +201,25 @@ def main():
 
     try:
         if run_mode == "one_shot":
-            print("one‑shot模式，執行一次掃描完畢即結束")
-            scan_once()
+            print("one-shot模式，執行一次完整掃描（板塊+個股）")
+            scan_once(include_macro=True)
 
         elif run_mode == "long_run":
-            print("長駐模式：執行prompt → 隨機sleep8‑10分鐘 循環，到點退出")
+            print("長駐模式：第一輪跑板塊+個股，後續輪次只跑個股")
+            first_round = True
             while True:
                 if is_long_run_time_over():
                     print("已到長駐結束時間，退出迴圈，job完結")
                     break
                 try:
-                    scan_once()
+                    # 第一輪 include_macro=True，之後全部 False
+                    scan_once(include_macro=first_round)
+                    first_round = False
                 except Exception as e:
                     print(f"本輪掃描發生異常，跳過本輪：{str(e)}")
+                    first_round = False
 
-                sleep_sec = random.randint(8*60, 10*60)
+                sleep_sec = random.randint(8 * 60, 10 * 60)
                 print(f"本輪完成，休眠 {sleep_sec} 秒後下一輪掃描")
                 time.sleep(sleep_sec)
     finally:
