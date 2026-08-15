@@ -13,6 +13,12 @@ on:
     # HKT 22:00 → UTC 14:00 一次性
     - cron: '0 14 * * 1-5'
   workflow_dispatch:
+    inputs:
+      force_run:
+        description: '強制運行（忽略週末同時間窗口，即時跑一次測試用）'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   news_scan:
@@ -47,6 +53,7 @@ jobs:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           HK_NEWS_PROMPT: ${{ vars.HK_NEWS_PROMPT }}
+          FORCE_RUN: ${{ github.event.inputs.force_run }}
         run: python main.py
 
       - name: Save push cache
