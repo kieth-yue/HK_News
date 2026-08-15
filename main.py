@@ -107,7 +107,7 @@ def format_links(text: str) -> str:
     pattern = r'🔗 連結：[\s\S]*?(?=\n[💡🏷️📰⏰📌]|\n===|\Z)'
     return re.sub(pattern, replacer, text)
 
-# ========== 鎖與快取（時區 BUG 已修復：統一用 unix timestamp）==========
+# ========== 鎖與快取 ==========
 def load_cache():
     if not os.path.exists(CACHE_FILE):
         return {"pushed": []}
@@ -130,7 +130,6 @@ def acquire_lock() -> bool:
         try:
             with open(LOCK_FILE, "r") as f:
                 ts = float(f.read().strip())
-            # 直接用 unix timestamp 秒數差，唔再做時區轉換
             if (now_ts - ts) > 12 * 60:
                 os.unlink(LOCK_FILE)
             else:
@@ -158,27 +157,19 @@ def release_lock():
 def get_run_mode():
     hkt = get_hkt_now()
     h, m = hkt.hour, hkt.minute
-    # 長駐窗口
     if 8 <= h < 10:
         return "long_run"
     if (h == 11) or (h == 12) or (h == 13 and m <= 30):
         return "long_run"
-    # 一次性定時點（加 ±5 分鐘容差，應對 cron 延遲）
     if (h == 15 and m <= 5) or (h == 15 and 45 <= m <= 55) or (h == 22 and m <= 5):
         return "one_shot"
     return "none"
 
 def is_long_run_time_over():
-    """判斷當前長駐 job 係咪到結束時間。
-    08-10 時段：10:00-10:59 退出
-    11-13:30 時段：13:31 後或 14:00 後退出
-    """
     hkt = get_hkt_now()
     h, m = hkt.hour, hkt.minute
-    # 08-10 時段結束（10:00-10:59）
     if 10 <= h < 11:
         return True
-    # 11-13:30 時段結束
     if h >= 14 or (h == 13 and m > 30):
         return True
     return False
@@ -209,23 +200,30 @@ def gemini_call(prompt: str, max_retries: int = 3):
             else:
                 raise
 
-# ========== 核心掃描（去重 index 錯位 BUG 已修復）==========
-def scan_once(include_macro: bool = True):
+# ========== 核心掃描 ==========
+def scan_once(include_macro: bool = True, macro_pushed_set=None):
+    """
+    include_macro=True  → 第一輪 / one-shot：完整掃描板塊+個股
+    include_macro=False → 後續輪次：重點掃個股，但若有突發黑天鵝仍可出板塊警報
+    macro_pushed_set    → 同一個 job 內已推送嘅板塊標題，用於去重（None = 唔去重）
+    """
     cache = load_cache()
     pushed_set = set(cache.get("pushed", []))
 
     if include_macro:
         prompt = (
             SYSTEM_PROMPT
-            + "\n\n【額外要求】板塊宏觀消息必須係真正重量級、足以引發整個板塊集體異動或大市急升急跌嘅消息先好輸出；"
-              "如果只係普通政策、常規公開市場操作、輕微影響或市場已消化嘅消息，"
-              "請直接喺板塊區塊寫「當前時段無符合條件之重大利好」，唔好勉強列出。"
+            + "\n\n【板塊/宏觀篩選標準】\n"
+              "- 必須具備【明確短線資金催化力（Catalyst）】或【重大市場影響力】的政策、外圍事件或行業重磅消息（利好或利淡皆可）。\n"
+              "- 排除無炒作價值的常規例行操作、盤後無關痛癢的空泛言論。\n"
+              "- 若當前時段確實無具交易價值的板塊消息，請在該區塊直接註明「當前時段無具催化力之板塊消息」。"
         )
     else:
         prompt = (
             SYSTEM_PROMPT
-            + "\n\n【重要補充指令】今次掃描**只需要輸出「=== 【個股重大利好】 ===」部分**，"
-              "**唔好輸出「=== 【板塊宏觀消息】 ===」區塊**，板塊宏觀消息已經喺本次啟動第一輪掃描過，唔使重複。"
+            + "\n\n【盤中即時掃描指令】\n"
+              "1. 重點輸出「=== 【個股重大利好/異動】 ===」。\n"
+              "2. 若盤中出現【突發重磅宏觀/政策黑天鵝】（如突發降準、停火、重磅監管變動），仍可輸出「=== 【板塊宏觀消息】 ===」作緊急警報；若無突發重大宏觀事件，則直接省略宏觀區塊，只輸出個股。"
         )
 
     llm_result = gemini_call(prompt)
@@ -239,8 +237,10 @@ def scan_once(include_macro: bool = True):
     # 切分板塊同個股區塊
     macro_part = ""
     stock_part = ""
-    if "=== 【個股重大利好】 ===" in llm_result:
-        parts = llm_result.split("=== 【個股重大利好】 ===")
+    if "=== 【個股重大利好" in llm_result or "=== 【個股重大利好/異動】 ===" in llm_result:
+        # 兼容兩種個股標題
+        split_marker = "=== 【個股重大利好/異動】 ===" if "=== 【個股重大利好/異動】 ===" in llm_result else "=== 【個股重大利好】 ==="
+        parts = llm_result.split(split_marker)
         stock_part = parts[1] if len(parts) > 1 else ""
         if "=== 【板塊宏觀消息】 ===" in parts[0]:
             macro_parts = parts[0].split("=== 【板塊宏觀消息】 ===")
@@ -249,9 +249,27 @@ def scan_once(include_macro: bool = True):
         macro_parts = llm_result.split("=== 【板塊宏觀消息】 ===")
         macro_part = macro_parts[1] if len(macro_parts) > 1 else ""
 
-    macro_block_text = macro_part.strip()
+    # 板塊消息逐條解析 + 同一 job 內去重
+    macro_entries = []
+    if macro_part.strip() and "📰" in macro_part:
+        macro_raw_entries = re.split(r'(?=📰)', macro_part.strip())
+        for entry in macro_raw_entries:
+            entry = entry.strip()
+            if not entry or "📰" not in entry:
+                continue
+            title_match = re.search(r"📰 新聞標題：([^\n]+)", entry)
+            title = title_match.group(1).strip() if title_match else entry[:50]
+            if macro_pushed_set is not None:
+                if title in macro_pushed_set:
+                    print(f"已過濾重複板塊消息: {title}")
+                    continue
+                macro_pushed_set.add(title)
+            macro_entries.append(entry)
 
-    # 個股逐條解析（以 📰 為邊界切分，每條獨立提取標題+代碼，徹底消除 index 錯位）
+    final_macro_text = "\n\n".join(macro_entries).strip()
+    macro_has_news = len(macro_entries) > 0
+
+    # 個股逐條解析 + 跨 job 持久化去重
     filtered_stock_entries = []
     stock_entries = re.split(r'(?=📰)', stock_part.strip())
 
@@ -274,8 +292,6 @@ def scan_once(include_macro: bool = True):
             print(f"已過濾重複新聞: {key}")
 
     final_stock_text = "\n\n".join(filtered_stock_entries).strip()
-
-    macro_has_news = "📰" in macro_block_text
     stock_has_news = len(filtered_stock_entries) > 0
 
     if not macro_has_news and not stock_has_news:
@@ -284,9 +300,9 @@ def scan_once(include_macro: bool = True):
 
     # 組裝推送內容
     final_out = []
-    if include_macro and macro_has_news:
+    if macro_has_news:
         final_out.append("=== 【板塊宏觀消息】 ===")
-        final_out.append(macro_block_text)
+        final_out.append(final_macro_text)
     if stock_has_news:
         final_out.append("=== 【個股重大利好】 ===")
         final_out.append(final_stock_text)
@@ -326,14 +342,15 @@ def main():
             scan_once(include_macro=True)
 
         elif run_mode == "long_run":
-            print("長駐模式：第一輪跑板塊+個股，後續輪次只跑個股")
+            print("長駐模式：第一輪跑板塊+個股，後續輪次重點跑個股（突發黑天鵝仍會出板塊警報）")
             first_round = True
+            macro_pushed = set()  # 同一 job 內板塊消息去重
             while True:
                 if is_long_run_time_over():
                     print("已到長駐結束時間，退出迴圈，job完結")
                     break
                 try:
-                    scan_once(include_macro=first_round)
+                    scan_once(include_macro=first_round, macro_pushed_set=macro_pushed)
                     first_round = False
                 except Exception as e:
                     print(f"本輪掃描發生異常，跳過本輪：{str(e)}")
