@@ -110,6 +110,11 @@ def format_links(text: str) -> str:
 # ========== 鎖與快取 ==========
 def load_cache():
     if not os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"pushed": []}, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"創建緩存文件失敗: {e}")
         return {"pushed": []}
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
@@ -200,43 +205,16 @@ def gemini_call(prompt: str, max_retries: int = 3):
             else:
                 raise
 
-# ========== 格式嚴格要求（追加到每個 prompt）==========
-FORMAT_RULES = (
-    "\n\n【格式要求 - 必須嚴格遵守，違反格式等於出任務失敗】\n"
-    "- 直接輸出結果，**唔好加入任何思考過程、時間判斷說話、前言或後語**（例如「The current time is...」「Based on search results...」等一律禁止）。\n"
-    "- 必須使用 === 【板塊宏觀消息】 === 同 === 【個股重大利好】 === 作為區塊標題（即係用 === 包圍，唔好用 **粗體** 或其他格式代替）。\n"
-    "- 每一條新聞**必須嚴格使用以下格式**，唔好使用編號列表（1. 2. 3.）：\n"
-    "  📰 新聞標題：[完整標題]\n"
-    "  🏷️ 股票：[名稱] [代號.HK]（僅個股區塊需要）\n"
-    "  ⏰ 發布時間：[YYYY-MM-DD HH:MM HKT]\n"
-    "  📌 來源：[媒體名稱]\n"
-    "  🔗 連結：[網址]\n"
-    "  💡 利好邏輯/摘要：[1-2句]\n"
-    "- 若某區塊無符合條件嘅新聞，直接喺該區塊下方寫「當前時段無符合條件之重大利好」，唔好列出未達標嘅新聞。"
-)
-
 # ========== 核心掃描 ==========
 def scan_once(include_macro: bool = True, macro_pushed_set=None):
     cache = load_cache()
     pushed_set = set(cache.get("pushed", []))
 
+    # 代碼淨係講一句：而家係咩模式，其餘全部由 Variable prompt 控制
     if include_macro:
-        prompt = (
-            SYSTEM_PROMPT
-            + "\n\n【板塊/宏觀篩選標準】\n"
-              "- 必須具備【明確短線資金催化力（Catalyst）】或【重大市場影響力】的政策、外圍事件或行業重磅消息（利好或利淡皆可）。\n"
-              "- 排除無炒作價值的常規例行操作、盤後無關痛癢的空泛言論。\n"
-              "- 若當前時段確實無具交易價值的板塊消息，請在該區塊直接註明「當前時段無具催化力之板塊消息」。"
-            + FORMAT_RULES
-        )
+        prompt = SYSTEM_PROMPT + "\n\n【當前掃描模式：模式A — 首輪/定時掃描，請完整輸出板塊+個股】"
     else:
-        prompt = (
-            SYSTEM_PROMPT
-            + "\n\n【盤中即時掃描指令】\n"
-              "1. 重點輸出「=== 【個股重大利好】 ===」。\n"
-              "2. 若盤中出現【突發重磅宏觀/政策黑天鵝】（如突發降準、停火、重磅監管變動），仍可輸出「=== 【板塊宏觀消息】 ===」作緊急警報；若無突發重大宏觀事件，則直接省略宏觀區塊，只輸出個股。"
-            + FORMAT_RULES
-        )
+        prompt = SYSTEM_PROMPT + "\n\n【當前掃描模式：模式B — 盤中輪詢掃描，重點輸出個股；僅突發黑天鵝先出板塊】"
 
     llm_result = gemini_call(prompt)
     print("=== Gemini output ===")
@@ -253,20 +231,17 @@ def scan_once(include_macro: bool = True, macro_pushed_set=None):
         "沒有符合條件", "没有符合条件"
     ])
 
-    # 完全冇新聞標記同區塊標題 → 唔推送
     if not has_news_emoji and not has_section:
         print("無任何新聞內容，唔推送飛書")
         return
 
-    # 有「無符合條件」但冇任何 📰 新聞條目 → 唔推送
     if explicit_no_news and not has_news_emoji:
         print("當前時段無符合條件之重大消息，唔推送飛書")
         return
 
-    # ===== 兜底：有區塊標題但冇 📰（Gemini 冇跟格式），提取內容原樣推送 =====
+    # 兜底：有區塊標題但冇 📰（Gemini 冇跟格式），提取內容原樣推送
     if has_section and not has_news_emoji:
         print("⚠️ Gemini 冇跟從輸出格式，提取內容原樣推送")
-        # 由第一個區塊標題開始截取
         start_candidates = []
         if has_macro_section:
             start_candidates.append(llm_result.find("【板塊宏觀消息】"))
@@ -274,7 +249,6 @@ def scan_once(include_macro: bool = True, macro_pushed_set=None):
             start_candidates.append(llm_result.find("【個股重大利好"))
         start_idx = min(i for i in start_candidates if i >= 0)
         raw_content = llm_result[start_idx:]
-        # 清走結尾嘅「無符合條件」語句
         raw_content = re.sub(r'\n*當前時段[^。\n]*(?:之重大利好|之板塊消息)\s*$', '', raw_content).strip()
         if raw_content:
             raw_content = format_links(raw_content)
@@ -283,8 +257,7 @@ def scan_once(include_macro: bool = True, macro_pushed_set=None):
             print("兜底提取後內容為空，唔推送")
         return
 
-    # ===== 正常格式解析 =====
-    # 切分板塊同個股區塊
+    # 正常格式解析
     macro_part = ""
     stock_part = ""
     if "=== 【個股重大利好" in llm_result:
@@ -347,7 +320,6 @@ def scan_once(include_macro: bool = True, macro_pushed_set=None):
         print("篩選後無新發布之實質新聞，唔推送飛書")
         return
 
-    # 組裝推送內容
     final_out = []
     if macro_has_news:
         final_out.append("=== 【板塊宏觀消息】 ===")
