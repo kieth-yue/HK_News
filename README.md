@@ -1,2 +1,2 @@
-# Y_News
+# News
 News
