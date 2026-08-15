@@ -86,6 +86,29 @@ def send_feishu(raw_text: str) -> int:
             time.sleep(3)
     return -1
 
+# ========== 文本後處理 ==========
+def format_links(text: str) -> str:
+    """將超長 URL 轉成 Markdown 短連結 [點擊查看](url)，多個連結只取第一個，確保一行顯示"""
+    def replacer(m):
+        urls = re.findall(r'https?://\S+', m.group(0))
+        if urls:
+            return f"🔗 連結：[點擊查看]({urls[0]})"
+        return m.group(0)
+    # 匹配 🔗 連結： 到下一個 emoji 行 / 區塊標題 / 字串結尾
+    pattern = r'🔗 連結：[\s\S]*?(?=\n[💡🏷️📰⏰📌]|\n===|\Z)'
+    return re.sub(pattern, replacer, text)
+
+def should_skip_macro(macro_text: str) -> bool:
+    """板塊區塊如果表示無符合條件，就跳過唔顯示"""
+    skip_keywords = [
+        "無符合條件", "冇符合條件", "无符合条件",
+        "沒有符合條件", "没有符合条件", "冇符合", "無符合"
+    ]
+    for kw in skip_keywords:
+        if kw in macro_text:
+            return True
+    return False
+
 # ========== 時間 / 鎖 / 緩存 ==========
 def get_hkt_now() -> datetime:
     return datetime.utcnow() + timedelta(hours=8)
@@ -144,13 +167,13 @@ def is_long_run_time_over():
         return True
     return False
 
-# ========== Gemini 調用（唯一扣 token 嘅地方）==========
+# ========== Gemini 調用 ==========
 def gemini_call(prompt: str):
-    response = CLIENT.models.generate_content(
+    chat = CLIENT.chats.create(
         model=MODEL_NAME,
-        contents=prompt,
         config=GEMINI_CONFIG
     )
+    response = chat.send_message(prompt)
     return response.text
 
 def parse_extract_keys(gemini_output: str):
@@ -165,7 +188,12 @@ def scan_once(include_macro: bool = True):
     pushed_set = set(cache.get("pushed", []))
 
     if include_macro:
-        prompt = SYSTEM_PROMPT
+        prompt = (
+            SYSTEM_PROMPT
+            + "\n\n【額外要求】板塊宏觀消息必須係真正重量級、足以引發整個板塊集體異動或大市急升急跌嘅消息先好輸出；"
+              "如果只係普通政策、常規公開市場操作、輕微影響或市場已消化嘅消息，"
+              "請直接喺板塊區塊寫「當前時段無符合條件之重大利好」，唔好勉強列出。"
+        )
     else:
         prompt = (
             SYSTEM_PROMPT
@@ -197,6 +225,7 @@ def scan_once(include_macro: bool = True):
     macro_block_text = "\n".join(block_macro).strip()
     stock_block_text = "\n".join(block_stock).strip()
 
+    # 個股去重
     filtered_stock_lines = []
     stock_lines_all = stock_block_text.split("\n")
     idx_title = 0
@@ -218,14 +247,19 @@ def scan_once(include_macro: bool = True):
 
     final_stock_text = "\n".join(filtered_stock_lines).strip()
 
+    # 組裝輸出
     final_out = []
-    if include_macro:
+    if include_macro and not should_skip_macro(macro_block_text):
         final_out.append("=== 【板塊宏觀消息】 ===")
         final_out.append(macro_block_text)
     final_out.append("=== 【個股重大利好】 ===")
     final_out.append(final_stock_text)
 
     final_text = "\n".join(final_out)
+
+    # 連結後處理：超長 URL → 短連結，一行顯示
+    final_text = format_links(final_text)
+
     send_feishu(final_text)
 
     cache["pushed"] = list(pushed_set)
