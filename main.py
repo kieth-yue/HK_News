@@ -16,6 +16,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK")
 FEISHU_SECRET = os.getenv("FEISHU_SECRET", "")
 SYSTEM_PROMPT = os.getenv("HK_NEWS_PROMPT", "")
+FORCE_RUN = os.getenv("FORCE_RUN", "false").lower() == "true"
 
 CACHE_FILE = "push_cache.json"
 LOCK_FILE = "run.lock"
@@ -143,7 +144,7 @@ def is_long_run_time_over():
         return True
     return False
 
-# ========== Gemini 調用（新 SDK，唯一扣 token 嘅地方）==========
+# ========== Gemini 調用（唯一扣 token 嘅地方）==========
 def gemini_call(prompt: str):
     response = CLIENT.models.generate_content(
         model=MODEL_NAME,
@@ -235,15 +236,18 @@ def main():
     hkt_now = get_hkt_now()
     print(f"HKT now:{hkt_now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    if is_weekend():
-        print("週末，退出")
-        return
-
-    run_mode = get_run_mode()
-    print(f"運行模式: {run_mode}")
-    if run_mode == "none":
-        print("不在執行窗口，退出")
-        return
+    if FORCE_RUN:
+        print("⚠️ FORCE_RUN 模式：忽略週末同時間窗口，即時跑一次")
+        run_mode = "one_shot"
+    else:
+        if is_weekend():
+            print("週末，退出")
+            return
+        run_mode = get_run_mode()
+        print(f"運行模式: {run_mode}")
+        if run_mode == "none":
+            print("不在執行窗口，退出")
+            return
 
     if not acquire_lock():
         print("已有另一個實例正在執行，跳過")
