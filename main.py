@@ -107,6 +107,13 @@ def format_links(text: str) -> str:
     pattern = r'🔗 連結：[\s\S]*?(?=\n[💡🏷️📰⏰📌]|\n===|\Z)'
     return re.sub(pattern, replacer, text)
 
+def normalize_stock_code(raw_code: str) -> str:
+    """將 HK.09988 或 09988.HK 統一標準化為 09988.HK"""
+    digits_match = re.search(r"\d{4,5}", raw_code)
+    if digits_match:
+        return f"{digits_match.group(0)}.HK"
+    return "UNKNOWN"
+
 # ========== 鎖與快取 ==========
 def load_cache():
     if not os.path.exists(CACHE_FILE):
@@ -210,7 +217,6 @@ def scan_once(include_macro: bool = True, macro_pushed_set=None):
     cache = load_cache()
     pushed_set = set(cache.get("pushed", []))
 
-    # 代碼淨係講一句：而家係咩模式，其餘全部由 Variable prompt 控制
     if include_macro:
         prompt = SYSTEM_PROMPT + "\n\n【當前掃描模式：模式A — 首輪/定時掃描，請完整輸出板塊+個股】"
     else:
@@ -301,10 +307,11 @@ def scan_once(include_macro: bool = True, macro_pushed_set=None):
             continue
 
         title_match = re.search(r"📰 新聞標題：([^\n]+)", entry)
-        stock_match = re.search(r"🏷️ 股票：.*?(\d{4,5}\.HK)", entry, re.DOTALL)
+        # ✅ 兼容 HK.09988 同 09988.HK 兩種格式，並統一標準化
+        stock_match = re.search(r"🏷️ 股票：.*?(HK\.\d{4,5}|\d{4,5}\.HK)", entry, re.DOTALL)
 
         title = title_match.group(1).strip() if title_match else ""
-        code = stock_match.group(1).strip() if stock_match else "UNKNOWN"
+        code = normalize_stock_code(stock_match.group(1)) if stock_match else "UNKNOWN"
 
         key = f"{code}||{title}"
         if key not in pushed_set:
