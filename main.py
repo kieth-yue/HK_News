@@ -7,7 +7,8 @@ import base64
 import hashlib
 import hmac
 from datetime import datetime, timedelta
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import requests
 
 # ========== 讀取 Secrets / Variables 環境變數 ==========
@@ -20,12 +21,11 @@ CACHE_FILE = "push_cache.json"
 LOCK_FILE = "run.lock"
 MODEL_NAME = "gemini-2.5-flash"
 
-# ========== Gemini 全局初始化（只做一次，不扣 token）==========
-genai.configure(api_key=GEMINI_API_KEY)
-GEMINI_MODEL = genai.GenerativeModel(
-    MODEL_NAME,
-    generation_config={"temperature": 0.1},
-    tools=[{"google_search": {}}]
+# ========== Gemini 全局初始化（新 SDK，只做一次）==========
+CLIENT = genai.Client(api_key=GEMINI_API_KEY)
+GEMINI_CONFIG = types.GenerateContentConfig(
+    temperature=0.1,
+    tools=[types.Tool(google_search=types.GoogleSearch())]
 )
 
 # ========== 飛書推送 ==========
@@ -143,10 +143,14 @@ def is_long_run_time_over():
         return True
     return False
 
-# ========== Gemini 調用（唯一扣 token 嘅地方）==========
+# ========== Gemini 調用（新 SDK，唯一扣 token 嘅地方）==========
 def gemini_call(prompt: str):
-    resp = GEMINI_MODEL.generate_content(prompt)
-    return resp.text
+    response = CLIENT.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt,
+        config=GEMINI_CONFIG
+    )
+    return response.text
 
 def parse_extract_keys(gemini_output: str):
     stock_pattern = re.compile(r"🏷️ 股票：.*?(\d+\.HK)", re.DOTALL)
