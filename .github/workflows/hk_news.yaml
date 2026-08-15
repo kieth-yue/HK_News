@@ -1,21 +1,24 @@
 name: HK Stock News Monitor
+
 on:
   schedule:
-    # HKT 08:00 啟動長駐Job，程式內迴圈跑到10:00自行退出 | UTC 00:00
+    # HKT 08:00 → UTC 00:00 長駐job啟動（程式內跑到10:00退出）
     - cron: '0 0 * * 1-5'
-    # HKT 11:00 啟動長駐Job，程式內迴圈跑到13:30自行退出 | UTC 03:00
+    # HKT 11:00 → UTC 03:00 長駐job啟動（程式內跑到13:30退出）
     - cron: '0 3 * * 1-5'
-    # 一次性定時執行
-    - cron: '0 7 * * 1-5'   # HKT15:00
-    - cron: '50 7 * * 1-5' # HKT15:50
-    - cron: '0 14 * * 1-5' # HKT22:00
+    # HKT 15:00 → UTC 07:00 一次性
+    - cron: '0 7 * * 1-5'
+    # HKT 15:50 → UTC 07:50 一次性
+    - cron: '50 7 * * 1-5'
+    # HKT 22:00 → UTC 14:00 一次性
+    - cron: '0 14 * * 1-5'
   workflow_dispatch:
 
 jobs:
   news_scan:
     runs-on: ubuntu-latest
     concurrency:
-      group: ${{ secrets.WORKFLOW_LOCK }}
+      group: hk-news-monitor
       cancel-in-progress: true
 
     steps:
@@ -31,17 +34,18 @@ jobs:
         uses: actions/cache@v4
         with:
           path: push_cache.json
-          key: hk‑news‑cache‑${{ github.run_id }}
-          restore-keys: hk‑news‑cache‑
+          key: hk-news-cache-${{ github.run_id }}
+          restore-keys: hk-news-cache-
 
       - name: Install dependencies
         run: |
-          pip install google-generativeai requests python-dateutil
+          pip install -r requirements.txt
 
       - name: Run news monitor
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           HK_NEWS_PROMPT: ${{ vars.HK_NEWS_PROMPT }}
         run: python main.py
 
@@ -49,4 +53,4 @@ jobs:
         uses: actions/cache@v4
         with:
           path: push_cache.json
-          key: hk‑news‑cache‑${{ github.run_id }}
+          key: hk-news-cache-${{ github.run_id }}
