@@ -42,7 +42,7 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-          HK_NEWS_PROMPT: ${{ secrets.HK_NEWS_PROMPT }}
+          HK_NEWS_PROMPT: ${{ vars.HK_NEWS_PROMPT }}
         run: python main.py
 
       - name: Save push cache
