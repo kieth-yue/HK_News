@@ -23,6 +23,7 @@ on:
 jobs:
   news_scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     concurrency:
       group: hk-news-monitor
       cancel-in-progress: true
