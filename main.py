@@ -24,8 +24,11 @@ MODEL_NAME = "gemini-2.5-flash"
 
 HKT = timezone(timedelta(hours=8))
 
-# ========== Gemini 全局初始化（只做一次）==========
-CLIENT = genai.Client(api_key=GEMINI_API_KEY)
+# ========== Gemini 全局初始化（180秒超時，防止無限掛住）==========
+CLIENT = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options=types.HttpOptions(timeout=180000)
+)
 GEMINI_CONFIG = types.GenerateContentConfig(
     temperature=0.1,
     tools=[types.Tool(google_search=types.GoogleSearch())]
@@ -186,12 +189,13 @@ def is_long_run_time_over():
         return True
     return False
 
-# ========== Gemini 調用（含 429 退避重試）==========
-def is_rate_limit_error(e: Exception) -> bool:
+# ========== Gemini 調用（含超時 + 429/超時退避重試）==========
+def is_retryable_error(e: Exception) -> bool:
     err_str = str(e).lower()
     return any(kw in err_str for kw in [
         "429", "rate limit", "rate_limit", "resource exhausted",
-        "resource_exhausted", "quota", "too many requests"
+        "resource_exhausted", "quota", "too many requests",
+        "timeout", "timed out", "deadline exceeded", "503", "502", "500"
     ])
 
 def gemini_call(prompt: str, max_retries: int = 3):
@@ -204,10 +208,10 @@ def gemini_call(prompt: str, max_retries: int = 3):
             response = chat.send_message(prompt)
             return response.text
         except Exception as e:
-            if is_rate_limit_error(e) and attempt < max_retries - 1:
+            if is_retryable_error(e) and attempt < max_retries - 1:
                 wait_sec = 60
-                print(f"⚠️ 遇到 Gemini 限流 (429/quota)，等待 {wait_sec} 秒後重試 "
-                      f"({attempt+1}/{max_retries})")
+                print(f"⚠️ Gemini 調用失敗（429/超時/暫時性錯誤），等待 {wait_sec} 秒後重試 "
+                      f"({attempt+1}/{max_retries}): {str(e)[:100]}")
                 time.sleep(wait_sec)
             else:
                 raise
@@ -307,7 +311,6 @@ def scan_once(include_macro: bool = True, macro_pushed_set=None):
             continue
 
         title_match = re.search(r"📰 新聞標題：([^\n]+)", entry)
-        # ✅ 兼容 HK.09988 同 09988.HK 兩種格式，並統一標準化
         stock_match = re.search(r"🏷️ 股票：.*?(HK\.\d{4,5}|\d{4,5}\.HK)", entry, re.DOTALL)
 
         title = title_match.group(1).strip() if title_match else ""
