@@ -1,86 +1,207 @@
-import random
-import time
-import json
 import os
-import yaml
-from rss_fetcher import fetch_all_stock_rss, match_news_to_stocks
-from ai_filter import analyze_news_batch
-from feishu_push import send_feishu_card
+import json
+import time
+import random
+import re
+from datetime import datetime, timedelta
+import google.generativeai as genai
+import requests
+
+# ========== 讀取 Secrets 環境變數 ==========
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK")
+SYSTEM_PROMPT = os.getenv("HK_NEWS_PROMPT", "")
+
+CACHE_FILE = "push_cache.json"
+LOCK_FILE = "run.lock"
+MODEL_NAME = "gemini-2.5-flash"
+
+def get_hkt_now() -> datetime:
+    return datetime.utcnow() + timedelta(hours=8)
+
+def is_weekend() -> bool:
+    now = get_hkt_now()
+    return now.weekday() >= 5
+
+def load_cache():
+    if not os.path.exists(CACHE_FILE):
+        return {"pushed": []}
+    with open(CACHE_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_cache(cache_data):
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache_data, f, ensure_ascii=False, indent=2)
+
+def acquire_lock() -> bool:
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, "r") as f:
+                ts = float(f.read())
+            lock_dt = datetime.fromtimestamp(ts)
+            now = get_hkt_now()
+            if (now - lock_dt).total_seconds() > 12 * 60:
+                os.unlink(LOCK_FILE)
+            else:
+                return False
+        except Exception:
+            os.unlink(LOCK_FILE)
+    with open(LOCK_FILE, "w") as f:
+        f.write(str(get_hkt_now().timestamp()))
+    return True
+
+def release_lock():
+    if os.path.exists(LOCK_FILE):
+        os.unlink(LOCK_FILE)
+
+def get_run_mode():
+    hkt = get_hkt_now()
+    h, m = hkt.hour, hkt.minute
+    if 8 <= h < 10:
+        return "long_run"
+    if (h == 11) or (h == 12) or (h ==13 and m <=30):
+        return "long_run"
+    if (h ==15 and m ==0) or (h ==15 and m ==50) or (h ==22 and m ==0):
+        return "one_shot"
+    return "none"
+
+def is_long_run_time_over():
+    hkt = get_hkt_now()
+    h, m = hkt.hour, hkt.minute
+    if h >= 10:
+        return True
+    if h >=14 or (h ==13 and m >30):
+        return True
+    return False
+
+def gemini_call(prompt: str):
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(
+        MODEL_NAME,
+        generation_config={"temperature": 0.1},
+        tools=[{"google_search": {}}]
+    )
+    resp = model.generate_content(prompt)
+    return resp.text
+
+def send_feishu(raw_text: str):
+    payload = {
+        "msg_type": "interactive",
+        "card": {
+            "config": {"wide_screen_mode": True},
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": raw_text}}]
+        }
+    }
+    r = requests.post(FEISHU_WEBHOOK, json=payload, timeout=30)
+    return r.status_code
+
+def parse_extract_keys(gemini_output: str):
+    stock_pattern = re.compile(r"🏷️ 股票：.*?(\d+\.HK)", re.DOTALL)
+    title_pattern = re.compile(r"📰 新聞標題：(.*?)\n", re.DOTALL)
+    titles = title_pattern.findall(gemini_output)
+    stock_codes = stock_pattern.findall(gemini_output)
+    return titles, stock_codes
+
+def scan_once():
+    cache = load_cache()
+    pushed_set = set(cache.get("pushed", []))
+
+    llm_result = gemini_call(SYSTEM_PROMPT)
+    print("=== Gemini output ===")
+    print(llm_result)
+
+    titles, stock_codes = parse_extract_keys(llm_result)
+    lines = llm_result.splitlines()
+    block_macro = []
+    block_stock = []
+    mode = None
+    for line in lines:
+        if "=== 【板塊宏觀消息】 ===" in line:
+            mode = "macro"
+            continue
+        if "=== 【個股重大利好】 ===" in line:
+            mode = "stock"
+            continue
+        if mode == "macro":
+            block_macro.append(line)
+        if mode == "stock":
+            block_stock.append(line)
+
+    macro_block_text = "\n".join(block_macro).strip()
+    stock_block_text = "\n".join(block_stock).strip()
+
+    filtered_stock_lines = []
+    stock_lines_all = stock_block_text.split("\n")
+    idx_title = 0
+    skip_entry = False
+    for line in stock_lines_all:
+        if line.startswith("📰 新聞標題："):
+            skip_entry = False
+            current_title = line.replace("📰 新聞標題：", "").strip()
+            if idx_title < len(stock_codes):
+                code = stock_codes[idx_title]
+                key = f"{code}||{current_title}"
+                if key in pushed_set:
+                    skip_entry = True
+                else:
+                    pushed_set.add(key)
+                idx_title += 1
+        if not skip_entry:
+            filtered_stock_lines.append(line)
+
+    final_stock_text = "\n".join(filtered_stock_lines).strip()
+
+    final_out = [
+        "=== 【板塊宏觀消息】 ===",
+        macro_block_text,
+        "=== 【個股重大利好】 ===",
+        final_stock_text
+    ]
+    final_text = "\n".join(final_out)
+    send_feishu(final_text)
+
+    cache["pushed"] = list(pushed_set)
+    save_cache(cache)
 
 def main():
-    with open("config.yaml", "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-    
-    stock_pool_raw = os.environ.get("STOCK_POOL")
-    if not stock_pool_raw:
-        print("❌ 錯誤：環境變數 STOCK_POOL 不存在")
-        return
-        
-    # 重點修復：先解析為dict，再提取stock_pool數組
-    data = json.loads(stock_pool_raw)
-    stock_list = data["stock_pool"]
-    
-    # Debug 偵測日誌，測試完可以註釋掉
-    print(f"[DEBUG] stock_list 類型: {type(stock_list)}")
-    if isinstance(stock_list, list) and len(stock_list) > 0:
-        print(f"[DEBUG] 第一隻股票類型: {type(stock_list[0])}")
+    hkt_now = get_hkt_now()
+    print(f"HKT now:{hkt_now.strftime('%Y‑%m‑%d %H:%M:%S')}")
 
-    FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK")
-    SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY")
-
-    cache_file = config["cache_file"]
-    cache_set = set()
-    if os.path.exists(cache_file) and config["enable_push_cache"]:
-        with open(cache_file, "r", encoding="utf-8") as f:
-            cache_data = json.load(f)
-            cache_set = set(cache_data)
-
-    max_wait = config["scan_random_delay_max"]
-    print(f"隨機等待0-{max_wait//60}分鐘防風控...")
-    wait_time = random.randint(0, max_wait)
-    print(f"本次等待 {wait_time//60} 分 {wait_time%60} 秒")
-    time.sleep(wait_time)
-
-    print("="*50)
-    print("開始掃描新聞")
-    print("="*50)
-
-    all_raw_news = fetch_all_stock_rss(stock_list, config)
-    print(f"✅ 抓取原始新聞總數：{len(all_raw_news)}")
-
-    match_news = match_news_to_stocks(all_raw_news, stock_list)
-    print(f"✅ 匹配成功，送入AI分析新聞數：{len(match_news)}")
-
-    if len(match_news) == 0:
-        print("ℹ️ 本輪無相關新聞，結束掃描")
+    if is_weekend():
+        print("週末，退出")
         return
 
-    print("="*50)
-    print("開始AI智能分析")
-    print("="*50)
-    valid_bullish = analyze_news_batch(match_news, all_raw_news, SILICONFLOW_API_KEY, config["bullish_min_score"])
+    run_mode = get_run_mode()
+    print(f"運行模式: {run_mode}")
+    if run_mode == "none":
+        print("不在執行窗口，退出")
+        return
 
-    push_list = []
-    for item in valid_bullish:
-        cache_key = f"{item['target_code']}_{item['title']}_{item['pub_time'][:10]}"
-        if cache_key not in cache_set:
-            push_list.append(item)
-            cache_set.add(cache_key)
+    if not acquire_lock():
+        print("已有另一個實例正在執行，跳過")
+        return
 
-    print(f"✅ 去重後最終推送數量：{len(push_list)}")
+    try:
+        if run_mode == "one_shot":
+            print("one‑shot模式，執行一次掃描完畢即結束")
+            scan_once()
 
-    if push_list:
-        send_feishu_card(push_list, FEISHU_WEBHOOK)
-        print(f"🎉 已成功推送 {len(push_list)} 條重大利好至飛書")
-    else:
-        print("ℹ️ 本輪無符合門檻的重大利好，不發送飛書")
+        elif run_mode == "long_run":
+            print("長駐模式：執行prompt → 隨機sleep8‑10分鐘 循環，到點退出")
+            while True:
+                if is_long_run_time_over():
+                    print("已到長駐結束時間，退出迴圈，job完結")
+                    break
+                try:
+                    scan_once()
+                except Exception as e:
+                    print(f"本輪掃描發生異常，跳過本輪：{str(e)}")
 
-    if config["enable_push_cache"]:
-        with open(cache_file, "w", encoding="utf-8") as f:
-            json.dump(list(cache_set), f, ensure_ascii=False, indent=2)
-        print("💾 推送緩存已保存")
-    print("="*50)
-    print("本輪掃描完畢")
+                sleep_sec = random.randint(8*60, 10*60)
+                print(f"本輪完成，休眠 {sleep_sec} 秒後下一輪掃描")
+                time.sleep(sleep_sec)
+    finally:
+        release_lock()
 
 if __name__ == "__main__":
     main()
