@@ -21,6 +21,7 @@ FORCE_RUN = os.getenv("FORCE_RUN", "false").lower() == "true"
 CACHE_FILE = "push_cache.json"
 LOCK_FILE = "run.lock"
 MODEL_NAME = "gemini-2.5-flash"
+MAX_STOCK_NEWS = 5
 
 HKT = timezone(timedelta(hours=8))
 
@@ -101,11 +102,11 @@ def send_feishu(raw_text: str) -> int:
 
 # ========== 文本後處理 ==========
 def format_links(text: str) -> str:
-    """將超長 URL 轉成 [點擊查看](<url>)；冇 URL 嘅空連結行直接移除"""
+    """將 URL 轉成 [點擊查看](url)；冇 URL 嘅空連結行直接移除"""
     def replacer(m):
-        urls = re.findall(r'https?://[^\s\)\]>]+', m.group(0))
+        urls = re.findall(r'https?://[^\s\)\]]+', m.group(0))
         if urls:
-            return f"🔗 連結：[點擊查看](<{urls[0]}>)"
+            return f"🔗 連結：[點擊查看]({urls[0]})"
         return ""
     pattern = r'🔗 連結：[\s\S]*?(?=\n[💡🏷️📰⏰📌]|\n===|\Z)'
     text = re.sub(pattern, replacer, text)
@@ -113,12 +114,11 @@ def format_links(text: str) -> str:
     return text.strip()
 
 def convert_all_raw_urls(text: str) -> str:
-    """最後防線：將所有殘留嘅 raw URL 強制轉成 [點擊查看](<url>)"""
+    """最後防線：將所有殘留嘅 raw URL 強制轉成 [點擊查看](url)"""
     def replacer(m):
         url = m.group(0)
-        return f"[點擊查看](<{url}>)"
-    # 負向斷言：唔匹配已經喺 (<url>) 或 (url) 入面嘅 URL
-    text = re.sub(r'(?<![\(<])https?://[^\s\)\]<>]+', replacer, text)
+        return f"[點擊查看]({url})"
+    text = re.sub(r'(?<![\(])https?://[^\s\)\]]+', replacer, text)
     return text
 
 def append_grounding_source(text: str, grounding_urls: list) -> str:
@@ -128,7 +128,7 @@ def append_grounding_source(text: str, grounding_urls: list) -> str:
     if "點擊查看" in text:
         return text
     title, uri = grounding_urls[0]
-    text += f"\n\n---\n📎 參考來源：[點擊查看](<{uri}>)"
+    text += f"\n\n---\n📎 參考來源：[點擊查看]({uri})"
     return text
 
 def normalize_stock_code(raw_code: str) -> str:
@@ -189,23 +189,29 @@ def release_lock():
     except Exception:
         pass
 
-# ========== 時間窗口判斷 ==========
+# ========== 時間窗口判斷（寬鬆容錯，防止 cron 延遲漏報）==========
 def get_run_mode():
     hkt = get_hkt_now()
     h, m = hkt.hour, hkt.minute
-    if 8 <= h < 10:
+    # 長駐時段 08:00-13:59（實際結束由 is_long_run_time_over 控制）
+    if 8 <= h < 14:
         return "long_run"
-    if (h == 11) or (h == 12) or (h == 13 and m <= 30):
-        return "long_run"
-    if (h == 15 and m <= 5) or (h == 15 and 45 <= m <= 55) or (h == 22 and m <= 5):
+    # 15:00 / 15:50 one_shot，容錯至 16:15
+    if h == 15 or (h == 16 and m <= 15):
+        return "one_shot"
+    # 22:00 one_shot，容錯至 23:15
+    if h == 22 or (h == 23 and m <= 15):
         return "one_shot"
     return "none"
 
 def is_long_run_time_over():
+    """判斷當前是否應該結束長駐迴圈（正區分早上/中午兩個時段）"""
     hkt = get_hkt_now()
     h, m = hkt.hour, hkt.minute
+    # 早上時段結束：10:00-10:59
     if 10 <= h < 11:
         return True
+    # 中午時段結束：13:31 之後
     if h >= 14 or (h == 13 and m > 30):
         return True
     return False
@@ -268,10 +274,15 @@ def scan_once(include_macro: bool = True, macro_pushed_set=None):
     cache = load_cache()
     pushed_set = set(cache.get("pushed", []))
 
+    rank_instruction = (
+        "\n\n【重要】個股新聞必須按對股價嘅刺激力度（爆發力）由強到弱排序，"
+        "最強嘅排第一，最多輸出5條。"
+    )
+
     if include_macro:
-        prompt = SYSTEM_PROMPT + "\n\n【當前掃描模式：模式A — 首輪/定時掃描，請完整輸出板塊+個股】"
+        prompt = SYSTEM_PROMPT + rank_instruction + "\n\n【當前掃描模式：模式A — 首輪/定時掃描，請完整輸出板塊+個股】"
     else:
-        prompt = SYSTEM_PROMPT + "\n\n【當前掃描模式：模式B — 盤中輪詢掃描，重點輸出個股；僅突發黑天鵝先出板塊】"
+        prompt = SYSTEM_PROMPT + rank_instruction + "\n\n【當前掃描模式：模式B — 盤中輪詢掃描，重點輸出個股；僅突發黑天鵝先出板塊】"
 
     llm_result, grounding_urls = gemini_call(prompt)
     print("=== Gemini output ===")
@@ -374,6 +385,11 @@ def scan_once(include_macro: bool = True, macro_pushed_set=None):
         else:
             print(f"已過濾重複新聞: {key}")
 
+    # ✅ 硬上限：最多 5 條（已按爆發力排序，頭5條最強）
+    if len(filtered_stock_entries) > MAX_STOCK_NEWS:
+        print(f"⚠️ Gemini 輸出 {len(filtered_stock_entries)} 條，截斷至 {MAX_STOCK_NEWS} 條（保留爆發力最強嘅頭5條）")
+        filtered_stock_entries = filtered_stock_entries[:MAX_STOCK_NEWS]
+
     final_stock_text = "\n\n".join(filtered_stock_entries).strip()
     stock_has_news = len(filtered_stock_entries) > 0
 
@@ -431,15 +447,17 @@ def main():
             first_round = True
             macro_pushed = set()
             while True:
-                if is_long_run_time_over():
-                    print("已到長駐結束時間，退出迴圈，job完結")
-                    break
+                # ✅ 先執行掃描，再檢查時間——確保即使 cron 延遲啟動都最少跑一次
                 try:
                     scan_once(include_macro=first_round, macro_pushed_set=macro_pushed)
                     first_round = False
                 except Exception as e:
                     print(f"本輪掃描發生異常，跳過本輪：{str(e)}")
                     first_round = False
+
+                if is_long_run_time_over():
+                    print("已到長駐結束時間，退出迴圈，job完結")
+                    break
 
                 sleep_sec = random.randint(8 * 60, 10 * 60)
                 print(f"本輪完成，休眠 {sleep_sec} 秒後下一輪掃描")
