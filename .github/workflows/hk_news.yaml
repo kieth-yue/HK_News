@@ -1,4 +1,4 @@
-name: HK Stock News Monitor
+name: HK News Monitor
 
 on:
   schedule:
@@ -57,9 +57,3 @@ jobs:
           HK_NEWS_PROMPT: ${{ vars.HK_NEWS_PROMPT }}
           FORCE_RUN: ${{ github.event.inputs.force_run }}
         run: python main.py
-
-      - name: Save push cache
-        uses: actions/cache@v4
-        with:
-          path: push_cache.json
-          key: hk-news-cache-${{ github.run_id }}
