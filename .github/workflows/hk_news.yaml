@@ -1,17 +1,18 @@
-name: HK Stock News Monitor
+name: HK News Monitor
 
 on:
   schedule:
-    # HKT 08:00 → UTC 00:00 長駐job啟動（程式內跑到10:00退出）
-    - cron: '0 0 * * 1-5'
-    # HKT 11:00 → UTC 03:00 長駐job啟動（程式內跑到13:30退出）
-    - cron: '0 3 * * 1-5'
-    # HKT 15:00 → UTC 07:00 一次性
-    - cron: '0 7 * * 1-5'
-    # HKT 15:50 → UTC 07:50 一次性
-    - cron: '50 7 * * 1-5'
-    # HKT 22:00 → UTC 14:00 一次性
-    - cron: '0 14 * * 1-5'
+    # HKT 08:01 → UTC 00:01 長駐job啟動（程式內跑到10:00退出）
+    - cron: '1 0 * * 1-5'
+    # HKT 11:02 → UTC 03:02 長駐job啟動（程式內跑到13:30退出）
+    - cron: '2 3 * * 1-5'
+    # HKT 15:01 → UTC 07:01 一次性
+    - cron: '1 7 * * 1-5'
+    # HKT 15:52 → UTC 07:52 一次性
+    - cron: '52 7 * * 1-5'
+    # HKT 22:01 → UTC 14:01 一次性
+    - cron: '1 14 * * 1-5'
+
   workflow_dispatch:
     inputs:
       force_run:
