@@ -101,26 +101,34 @@ def send_feishu(raw_text: str) -> int:
 
 # ========== 文本後處理 ==========
 def format_links(text: str) -> str:
-    """將超長 URL 轉成短連結；冇 URL 嘅空連結行直接移除"""
+    """將超長 URL 轉成 [點擊查看](<url>)；冇 URL 嘅空連結行直接移除"""
     def replacer(m):
-        urls = re.findall(r'https?://\S+', m.group(0))
+        urls = re.findall(r'https?://[^\s\)\]>]+', m.group(0))
         if urls:
-            return f"🔗 連結：[點擊查看]({urls[0]})"
+            return f"🔗 連結：[點擊查看](<{urls[0]}>)"
         return ""
     pattern = r'🔗 連結：[\s\S]*?(?=\n[💡🏷️📰⏰📌]|\n===|\Z)'
     text = re.sub(pattern, replacer, text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
+def convert_all_raw_urls(text: str) -> str:
+    """最後防線：將所有殘留嘅 raw URL 強制轉成 [點擊查看](<url>)"""
+    def replacer(m):
+        url = m.group(0)
+        return f"[點擊查看](<{url}>)"
+    # 負向斷言：唔匹配已經喺 (<url>) 或 (url) 入面嘅 URL
+    text = re.sub(r'(?<![\(<])https?://[^\s\)\]<>]+', replacer, text)
+    return text
+
 def append_grounding_source(text: str, grounding_urls: list) -> str:
     """如果文本冇任何連結，附加一個 Gemini 聯網搜尋來源 URL（確保有來源可追溯，防幻覺）"""
     if not grounding_urls:
         return text
-    if "點擊查看" in text or "http://" in text or "https://" in text:
+    if "點擊查看" in text:
         return text
     title, uri = grounding_urls[0]
-    clean_title = (title or "來源")[:40]
-    text += f"\n\n---\n📎 參考來源：[{clean_title}]({uri})"
+    text += f"\n\n---\n📎 參考來源：[點擊查看](<{uri}>)"
     return text
 
 def normalize_stock_code(raw_code: str) -> str:
@@ -304,6 +312,7 @@ def scan_once(include_macro: bool = True, macro_pushed_set=None):
         if raw_content:
             raw_content = format_links(raw_content)
             raw_content = append_grounding_source(raw_content, grounding_urls)
+            raw_content = convert_all_raw_urls(raw_content)
             send_feishu(raw_content)
         else:
             print("兜底提取後內容為空，唔推送")
@@ -384,6 +393,7 @@ def scan_once(include_macro: bool = True, macro_pushed_set=None):
     final_text = "\n\n".join(final_out)
     final_text = format_links(final_text)
     final_text = append_grounding_source(final_text, grounding_urls)
+    final_text = convert_all_raw_urls(final_text)
     send_feishu(final_text)
 
     cache["pushed"] = list(pushed_set)
