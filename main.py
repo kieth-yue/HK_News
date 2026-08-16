@@ -24,7 +24,7 @@ MODEL_NAME = "gemini-2.5-flash"
 
 HKT = timezone(timedelta(hours=8))
 
-# ========== Gemini 全局初始化（180秒超時，防止無限掛住）==========
+# ========== Gemini 全局初始化（180秒超時）==========
 CLIENT = genai.Client(
     api_key=GEMINI_API_KEY,
     http_options=types.HttpOptions(timeout=180000)
@@ -101,14 +101,27 @@ def send_feishu(raw_text: str) -> int:
 
 # ========== 文本後處理 ==========
 def format_links(text: str) -> str:
-    """將超長 URL 轉成 Markdown 短連結，多個連結只取第一個，一行顯示"""
+    """將超長 URL 轉成短連結；冇 URL 嘅空連結行直接移除"""
     def replacer(m):
         urls = re.findall(r'https?://\S+', m.group(0))
         if urls:
             return f"🔗 連結：[點擊查看]({urls[0]})"
-        return m.group(0)
+        return ""
     pattern = r'🔗 連結：[\s\S]*?(?=\n[💡🏷️📰⏰📌]|\n===|\Z)'
-    return re.sub(pattern, replacer, text)
+    text = re.sub(pattern, replacer, text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+def append_grounding_source(text: str, grounding_urls: list) -> str:
+    """如果文本冇任何連結，附加一個 Gemini 聯網搜尋來源 URL（確保有來源可追溯，防幻覺）"""
+    if not grounding_urls:
+        return text
+    if "點擊查看" in text or "http://" in text or "https://" in text:
+        return text
+    title, uri = grounding_urls[0]
+    clean_title = (title or "來源")[:40]
+    text += f"\n\n---\n📎 參考來源：[{clean_title}]({uri})"
+    return text
 
 def normalize_stock_code(raw_code: str) -> str:
     """將 HK.09988 或 09988.HK 統一標準化為 09988.HK"""
@@ -189,7 +202,7 @@ def is_long_run_time_over():
         return True
     return False
 
-# ========== Gemini 調用（含超時 + 429/超時退避重試）==========
+# ========== Gemini 調用（含超時 + 429重試 + grounding URL 提取）==========
 def is_retryable_error(e: Exception) -> bool:
     err_str = str(e).lower()
     return any(kw in err_str for kw in [
@@ -198,7 +211,32 @@ def is_retryable_error(e: Exception) -> bool:
         "timeout", "timed out", "deadline exceeded", "503", "502", "500"
     ])
 
+def extract_grounding_urls(response) -> list:
+    """從 Gemini response 嘅 grounding metadata 提取聯網搜尋來源 URL"""
+    urls = []
+    try:
+        if not response.candidates:
+            return urls
+        candidate = response.candidates[0]
+        metadata = getattr(candidate, 'grounding_metadata', None)
+        if not metadata:
+            return urls
+        chunks = getattr(metadata, 'grounding_chunks', None)
+        if not chunks:
+            return urls
+        for chunk in chunks:
+            web = getattr(chunk, 'web', None)
+            if web:
+                uri = getattr(web, 'uri', '')
+                title = getattr(web, 'title', '來源')
+                if uri:
+                    urls.append((title, uri))
+    except Exception as e:
+        print(f"提取 grounding URL 失敗: {e}")
+    return urls
+
 def gemini_call(prompt: str, max_retries: int = 3):
+    """返回 (text, grounding_urls)"""
     for attempt in range(max_retries):
         try:
             chat = CLIENT.chats.create(
@@ -206,7 +244,8 @@ def gemini_call(prompt: str, max_retries: int = 3):
                 config=GEMINI_CONFIG
             )
             response = chat.send_message(prompt)
-            return response.text
+            grounding_urls = extract_grounding_urls(response)
+            return response.text, grounding_urls
         except Exception as e:
             if is_retryable_error(e) and attempt < max_retries - 1:
                 wait_sec = 60
@@ -226,9 +265,11 @@ def scan_once(include_macro: bool = True, macro_pushed_set=None):
     else:
         prompt = SYSTEM_PROMPT + "\n\n【當前掃描模式：模式B — 盤中輪詢掃描，重點輸出個股；僅突發黑天鵝先出板塊】"
 
-    llm_result = gemini_call(prompt)
+    llm_result, grounding_urls = gemini_call(prompt)
     print("=== Gemini output ===")
     print(llm_result)
+    if grounding_urls:
+        print(f"=== Grounding 來源: {len(grounding_urls)} 個 URL ===")
 
     # 檢查有冇實質內容
     has_news_emoji = "📰" in llm_result
@@ -262,6 +303,7 @@ def scan_once(include_macro: bool = True, macro_pushed_set=None):
         raw_content = re.sub(r'\n*當前時段[^。\n]*(?:之重大利好|之板塊消息)\s*$', '', raw_content).strip()
         if raw_content:
             raw_content = format_links(raw_content)
+            raw_content = append_grounding_source(raw_content, grounding_urls)
             send_feishu(raw_content)
         else:
             print("兜底提取後內容為空，唔推送")
@@ -330,6 +372,7 @@ def scan_once(include_macro: bool = True, macro_pushed_set=None):
         print("篩選後無新發布之實質新聞，唔推送飛書")
         return
 
+    # 組裝推送內容
     final_out = []
     if macro_has_news:
         final_out.append("=== 【板塊宏觀消息】 ===")
@@ -340,6 +383,7 @@ def scan_once(include_macro: bool = True, macro_pushed_set=None):
 
     final_text = "\n\n".join(final_out)
     final_text = format_links(final_text)
+    final_text = append_grounding_source(final_text, grounding_urls)
     send_feishu(final_text)
 
     cache["pushed"] = list(pushed_set)
