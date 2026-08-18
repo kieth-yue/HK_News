@@ -338,22 +338,18 @@ MACRO_TOPIC_GROUPS = [
 
 
 def extract_keywords(text):
-    """從標題提取關鍵詞（中文 bigram + trigram + 英文）"""
+    """從標題提取關鍵詞（中文 bigram + 英文，用於板塊去重）"""
     cleaned = re.sub(r'[^\w\u4e00-\u9fff]', ' ', text)
     keywords = set()
-    # 英文單詞
     for w in re.findall(r'[a-zA-Z]{2,}', cleaned):
         wl = w.lower()
         if wl not in MACRO_STOP_WORDS:
             keywords.add(wl)
-    # 中文 bigram + trigram
     for segment in re.findall(r'[\u4e00-\u9fff]+', cleaned):
         for i in range(len(segment) - 1):
             bg = segment[i:i + 2]
             if bg not in MACRO_STOP_WORDS:
                 keywords.add(bg)
-        for i in range(len(segment) - 2):
-            keywords.add(segment[i:i + 3])
     return keywords
 
 
@@ -366,7 +362,10 @@ def _topic_group(text):
 
 
 def is_duplicate_macro(title, macro_cache, date_str):
-    """檢查板塊消息係咪同一主題（bigram 重疊 ≥ 40% 且 ≥3 個，或同主題組 ≥25%）"""
+    """檢查板塊消息係咪同一事件。
+    - 同主題組：bigram 重疊 ≥ 2 → 視為同一事件
+    - 唔同主題：bigram 重疊 ≥ 3 且比例 ≥ 35%
+    """
     new_kw = extract_keywords(title)
     if not new_kw:
         return False
@@ -379,11 +378,11 @@ def is_duplicate_macro(title, macro_cache, date_str):
         overlap = new_kw & old_kw
         min_len = min(len(new_kw), len(old_kw))
         ratio = len(overlap) / min_len if min_len > 0 else 0
-        # 標準：重疊 ≥ 3 個且比例 ≥ 40%
-        if len(overlap) >= 3 and ratio >= 0.4:
+        # 同主題組：只要 2 個關鍵 bigram 重疊就當同一事件
+        if new_topic >= 0 and len(overlap) >= 2:
             return True
-        # 同主題組放寬：重疊 ≥ 2 個且比例 ≥ 25%
-        if new_topic >= 0 and len(overlap) >= 2 and ratio >= 0.25:
+        # 唔同主題：重疊 ≥ 3 個且比例 ≥ 35%
+        if len(overlap) >= 3 and ratio >= 0.35:
             return True
     return False
 
@@ -653,6 +652,24 @@ def scan_once(session_name, turn_count, macro_pushed, config, prompts):
         print(f"...（省略 {len(llm_result) - 2000} 字元）")
     if grounding_urls:
         print(f"🔗 Grounding 來源: {len(grounding_urls)} 個 URL")
+
+    # 自動重試：回應太短 + 話無新聞 + 冇 grounding URL → 可能冇搜尋
+    if (len(llm_result) < 200 and is_no_news(llm_result)
+            and not grounding_urls and "📰" not in llm_result):
+        print("⚠️ Gemini 回應太短且冇搜尋來源，5 秒後強制重試一次...")
+        time.sleep(5)
+        force_search_prompt = prompt + (
+            "\n\n🚨 緊急指令：你上次冇執行 Google 搜尋就直接答「無新聞」，呢個係嚴重錯誤！"
+            "你必須立即呼叫 Google 搜尋工具，搜尋「港股 盈喜 業績 上調目標價 回購」等關鍵詞，"
+            "根據真實搜尋結果重新回答。唔搜尋就回答係違規行為。"
+        )
+        llm_result, grounding_urls = gemini_call(force_search_prompt, config)
+        print(f"=== 重試回應 ({len(llm_result)} 字元) ===")
+        print(llm_result[:2000])
+        if len(llm_result) > 2000:
+            print(f"...（省略 {len(llm_result) - 2000} 字元）")
+        if grounding_urls:
+            print(f"🔗 重試 Grounding 來源: {len(grounding_urls)} 個 URL")
 
     # 檢查有冇實質內容
     has_section = "【板塊宏觀消息】" in llm_result or "【個股重大利好" in llm_result
