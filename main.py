@@ -485,8 +485,10 @@ SYSTEM_INSTRUCTION = (
 )
 
 
-def gemini_call(prompt, config):
-    """調用 Gemini，返回 (text, grounding_urls)"""
+def gemini_call(prompt, config, chat=None):
+    """調用 Gemini，返回 (text, grounding_urls, chat)。
+    傳入 chat 可繼續同一對話（用於強制重試搜尋）。
+    """
     gcfg = config["gemini"]
     client = genai.Client(
         api_key=os.getenv("GEMINI_API_KEY", ""),
@@ -500,19 +502,20 @@ def gemini_call(prompt, config):
 
     for attempt in range(gcfg["max_retries"]):
         try:
-            chat = client.chats.create(model=gcfg["model"], config=gen_config)
+            if chat is None:
+                chat = client.chats.create(model=gcfg["model"], config=gen_config)
             response = chat.send_message(prompt)
             grounding = extract_grounding_urls(response)
-            return response.text or "", grounding
+            return response.text or "", grounding, chat
         except Exception as e:
             if is_retryable_error(e) and attempt < gcfg["max_retries"] - 1:
-                wait = gcfg["retry_wait_sec"] * (attempt + 1)  # 指數退避
+                wait = gcfg["retry_wait_sec"] * (attempt + 1)
                 print(f"⚠️ Gemini 調用失敗，{wait}s 後重試 "
                       f"({attempt + 1}/{gcfg['max_retries']}): {str(e)[:150]}")
                 time.sleep(wait)
             else:
                 print(f"❌ Gemini 調用最終失敗（已重試 {gcfg['max_retries']} 次）: {str(e)[:200]}")
-                return "", []  # 唔好 crash，返回空結果
+                return "", [], chat
 
 
 # ============================================================
@@ -661,7 +664,7 @@ def scan_once(session_name, turn_count, macro_pushed, config, prompts):
         print(f"📡 第 {turn_count} 輪掃描（只掃個股）")
 
     # 調用 Gemini
-    llm_result, grounding_urls = gemini_call(prompt, config)
+    llm_result, grounding_urls, chat = gemini_call(prompt, config)
     print(f"=== Gemini 回應 ({len(llm_result)} 字元) ===")
     print(llm_result[:2000])
     if len(llm_result) > 2000:
@@ -670,22 +673,27 @@ def scan_once(session_name, turn_count, macro_pushed, config, prompts):
         print(f"🔗 Grounding 來源: {len(grounding_urls)} 個 URL")
 
     # 自動重試：回應太短 + 話無新聞 + 冇 grounding URL → 可能冇搜尋
+    # 喺同一個 chat 對話入面追問，等 Gemini 見到自己上次偷懶嘅回應
     if (len(llm_result) < 200 and is_no_news(llm_result)
             and not grounding_urls and "📰" not in llm_result):
-        print("⚠️ Gemini 回應太短且冇搜尋來源，5 秒後強制重試一次...")
-        time.sleep(5)
-        force_search_prompt = prompt + (
-            "\n\n🚨 緊急指令：你上次冇執行 Google 搜尋就直接答「無新聞」，呢個係嚴重錯誤！"
-            "你必須立即呼叫 Google 搜尋工具，搜尋「港股 盈喜 業績 上調目標價 回購」等關鍵詞，"
-            "根據真實搜尋結果重新回答。唔搜尋就回答係違規行為。"
+        print("⚠️ Gemini 冇搜尋就答無新聞，喺同一對話中強制追問...")
+        time.sleep(3)
+        followup = (
+            "🚨 你剛才冇使用 Google 搜尋工具就直接答「無新聞」，呢個係違規！"
+            "請你立即使用 Google 搜尋工具，搜尋以下關鍵詞：\n"
+            "1. 港股 盈喜 2026年8月\n"
+            "2. 港股 中期業績 淨利潤 增長\n"
+            "3. 港股 上調目標價\n"
+            "4. site:cls.cn 港股 公告\n"
+            "搜尋後根據真實結果，按照格式重新輸出。唔好再話無新聞，除非你真係搜過。"
         )
-        llm_result, grounding_urls = gemini_call(force_search_prompt, config)
-        print(f"=== 重試回應 ({len(llm_result)} 字元) ===")
+        llm_result, grounding_urls, chat = gemini_call(followup, config, chat=chat)
+        print(f"=== 追問回應 ({len(llm_result)} 字元) ===")
         print(llm_result[:2000])
         if len(llm_result) > 2000:
             print(f"...（省略 {len(llm_result) - 2000} 字元）")
         if grounding_urls:
-            print(f"🔗 重試 Grounding 來源: {len(grounding_urls)} 個 URL")
+            print(f"🔗 追問 Grounding 來源: {len(grounding_urls)} 個 URL")
 
     # 檢查有冇實質內容
     has_section = "【板塊宏觀消息】" in llm_result or "【個股重大利好" in llm_result
