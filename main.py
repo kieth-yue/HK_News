@@ -463,6 +463,14 @@ def extract_grounding_urls(response):
     return urls
 
 
+SYSTEM_INSTRUCTION = (
+    "你係港股新聞分析員。你必須嚴格按照用戶指定嘅格式輸出，使用繁體中文。"
+    "禁止使用 Markdown 標題（**文字**）、項目符號（* 或 -）、編號列表、英文分析散文。"
+    "你嘅回應只能包含指定嘅 section 標記（=== 【...】 ===）同 📰 新聞條目，"
+    "或者「當前時段無符合條件」聲明，不得有任何前言、分析、解釋、後語。"
+)
+
+
 def gemini_call(prompt, config):
     """調用 Gemini，返回 (text, grounding_urls)"""
     gcfg = config["gemini"]
@@ -472,6 +480,7 @@ def gemini_call(prompt, config):
     )
     gen_config = types.GenerateContentConfig(
         temperature=0.1,
+        system_instruction=SYSTEM_INSTRUCTION,
         tools=[types.Tool(google_search=types.GoogleSearch())],
     )
 
@@ -604,6 +613,16 @@ def scan_once(session_name, turn_count, macro_pushed, config, prompts):
     # 組裝 prompt
     time_info = get_time_injection(now_hkt, news_after, session_name)
 
+    format_reminder = (
+        "\n⚠️ 最終格式檢查（違反即不合格）：\n"
+        "- 回應只能包含「=== 【板塊宏觀消息】 ===」同「=== 【個股重大利好】 ===」區塊\n"
+        "- 每條新聞必須以 📰 開頭，逐行使用 📰🏷️⏰📌🔗💡 欄位\n"
+        "- 禁止 Markdown 標題（**text**）、項目符號（* 或 -）、編號列表\n"
+        "- 禁止英文分析散文、禁止「Based on search results」等前言\n"
+        "- 直接輸出格式內容，唔好有任何解釋、分析、思考過程\n"
+        "- 無新聞時直接輸出「當前時段無符合條件之板塊消息」或「當前時段無符合條件之重大利好」"
+    )
+
     if turn_count == 1 and macro_prompt:
         # 第一輪：板塊 + 個股
         prompt = (
@@ -611,6 +630,7 @@ def scan_once(session_name, turn_count, macro_pushed, config, prompts):
             f"{time_info}"
             f"\n【掃描模式】首輪掃描，請先輸出「=== 【板塊宏觀消息】 ===」，"
             f"再輸出「=== 【個股重大利好】 ===」。"
+            f"{format_reminder}"
         )
         print("📡 第一輪掃描（板塊+個股）")
     else:
@@ -621,6 +641,7 @@ def scan_once(session_name, turn_count, macro_pushed, config, prompts):
             f"\n【掃描模式】盤中輪詢掃描，只輸出「=== 【個股重大利好】 ===」部分。"
             f"若盤中出現突發黑天鵝級宏觀事件（如突發戰爭、突發降準、重磅監管轉向），"
             f"可在最前面輸出「=== 【板塊宏觀消息】 ===」緊急警報；若無則不要輸出板塊區塊。"
+            f"{format_reminder}"
         )
         print(f"📡 第 {turn_count} 輪掃描（只掃個股）")
 
@@ -650,6 +671,11 @@ def scan_once(session_name, turn_count, macro_pushed, config, prompts):
 
     # 切分區塊
     macro_text, stock_text = split_sections(llm_result)
+
+    # 格式合規檢查：有 section 標記但冇 🰱 → Gemini 冇跟格式
+    if has_section and not has_news_emoji and not is_no_news(llm_result):
+        print("⚠️ Gemini 回應有 section 標記但冇 📰 格式，可能冇跟從輸出格式！")
+        print("⚠️ 首 500 字元：", llm_result[:500])
 
     # 準備真實來源 URL（grounding metadata）
     real_urls = [uri for _, uri in grounding_urls if "vertexaisearch" not in uri]
