@@ -132,10 +132,22 @@ def is_session_over(session_name, hkt, config):
     return hkt >= end_dt
 
 
+def get_force_run_session(hkt):
+    """FORCE_RUN 模式：根據當前時間推斷最接近嘅 session，用佢嘅新聞時間範圍"""
+    h, m = hkt.hour, hkt.minute
+    t = h * 60 + m
+    if t < 10 * 60:        # 00:00 - 10:00 → 早市規則
+        return "morning"
+    elif t < 13 * 60:      # 10:00 - 13:00 → 午市規則
+        return "midday"
+    else:                  # 13:00 - 24:00 → 晚間規則
+        return "evening"
+
+
 def calc_news_after(session_name, hkt, config):
     """計算新聞有效起始時間"""
     if session_name is None:
-        return hkt - timedelta(hours=24)
+        session_name = get_force_run_session(hkt)
 
     na_type = config["sessions"][session_name]["news_after"]
 
@@ -779,10 +791,11 @@ def scan_once(session_name, turn_count, macro_pushed, config, prompts):
             print(f"🚫 {code} 超出時間範圍，丟棄: {title[:40]} ({format_hkt(news_time)})")
             continue
 
-        # 跨 job 去重：代號+日期
-        dedup_key = f"{code}|{date_str}"
+        # 跨 job 去重：代號+新聞日期（唔係推送日期，防止跨 session 重推同一單聞）
+        news_date = news_time.strftime("%Y-%m-%d") if news_time else date_str
+        dedup_key = f"{code}|{news_date}"
         if dedup_key in cache["stock"]:
-            print(f"🔁 {code} 今日已推送過，跳過: {title[:40]}")
+            print(f"🔁 {code} 新聞日期 {news_date} 已推送過，跳過: {title[:40]}")
             continue
 
         # 加入連結
@@ -854,8 +867,10 @@ def main():
         print("⚠️ HK_NEWS_PROMPT_MACRO 未設置，板塊消息將被跳過")
 
     if force_run:
-        print("⚠️ FORCE_RUN 模式：忽略週末同時間窗口，即時跑一次")
-        session_name = None
+        session_name = get_force_run_session(now_hkt)
+        news_after = calc_news_after(session_name, now_hkt, config)
+        print(f"⚠️ FORCE_RUN 模式：模擬 {session_name} session，即時跑一次")
+        print(f"=== 新聞有效範圍: {format_hkt(news_after)} ~ {format_hkt(now_hkt)} ===")
         run_mode = "one_shot"
     else:
         if is_weekend(now_hkt):
