@@ -447,6 +447,9 @@ def is_retryable_error(e):
         "resource_exhausted", "quota", "too many requests",
         "timeout", "timed out", "deadline exceeded",
         "503", "502", "500", "unavailable",
+        "server disconnected", "remoteprotocolerror",
+        "connection reset", "connection aborted", "connection error",
+        "network is unreachable", "eof occurred", "incomplete read",
     ])
 
 
@@ -503,12 +506,13 @@ def gemini_call(prompt, config):
             return response.text or "", grounding
         except Exception as e:
             if is_retryable_error(e) and attempt < gcfg["max_retries"] - 1:
-                wait = gcfg["retry_wait_sec"]
-                print(f"⚠️ Gemini 調用失敗（429/超時/暫時性），{wait}s 後重試 "
-                      f"({attempt + 1}/{gcfg['max_retries']}): {str(e)[:120]}")
+                wait = gcfg["retry_wait_sec"] * (attempt + 1)  # 指數退避
+                print(f"⚠️ Gemini 調用失敗，{wait}s 後重試 "
+                      f"({attempt + 1}/{gcfg['max_retries']}): {str(e)[:150]}")
                 time.sleep(wait)
             else:
-                raise
+                print(f"❌ Gemini 調用最終失敗（已重試 {gcfg['max_retries']} 次）: {str(e)[:200]}")
+                return "", []  # 唔好 crash，返回空結果
 
 
 # ============================================================
@@ -892,7 +896,10 @@ def main():
 
     try:
         if run_mode == "one_shot":
-            scan_once(session_name, 1, set(), config, (macro_prompt, stock_prompt))
+            try:
+                scan_once(session_name, 1, set(), config, (macro_prompt, stock_prompt))
+            except Exception as e:
+                print(f"❌ 掃描異常（已捕获，唔會 crash）: {str(e)[:300]}")
 
         elif run_mode == "long_run":
             turn = 0
