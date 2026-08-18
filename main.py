@@ -1,4 +1,14 @@
+#!/usr/bin/env python3
+"""
+港股新聞監控系統 v2
+- GitHub Actions 長駐掃描 + Gemini 2.5 Flash 聯網 + 飛書卡片推送
+- 板塊消息每 session 首輪推送，後續只掃個股
+- 去重：個股按「代號+日期」，板塊按「主題關鍵詞+日期」
+- 所有格式規則由 GitHub Variables 嘅 prompt 控制
+"""
+
 import os
+import sys
 import json
 import time
 import random
@@ -7,463 +17,863 @@ import base64
 import hashlib
 import hmac
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import yaml
 from google import genai
 from google.genai import types
 import requests
 
-# ========== 讀取 Secrets / Variables 環境變數 ==========
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK")
-FEISHU_SECRET = os.getenv("FEISHU_SECRET", "")
-SYSTEM_PROMPT = os.getenv("HK_NEWS_PROMPT", "")
-FORCE_RUN = os.getenv("FORCE_RUN", "false").lower() == "true"
-
-CACHE_FILE = "push_cache.json"
-LOCK_FILE = "run.lock"
-MODEL_NAME = "gemini-2.5-flash"
-MAX_STOCK_NEWS = 5
-
+# ============================================================
+# 常量
+# ============================================================
 HKT = timezone(timedelta(hours=8))
+SCRIPT_DIR = Path(__file__).parent
+CONFIG_PATH = SCRIPT_DIR / "config.yaml"
+LOCK_FILE = SCRIPT_DIR / "run.lock"
 
-# ========== Gemini 全局初始化（180秒超時）==========
-CLIENT = genai.Client(
-    api_key=GEMINI_API_KEY,
-    http_options=types.HttpOptions(timeout=180000)
-)
-GEMINI_CONFIG = types.GenerateContentConfig(
-    temperature=0.1,
-    tools=[types.Tool(google_search=types.GoogleSearch())]
+WEEKDAY_CN = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+WEEKDAY_EN = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+# 板塊標題去重停用詞
+MACRO_STOP_WORDS = set(
+    "的了在是及與和等將於為對由有個中年月日上下不亦都而但又或被向從"
+    "令可能該其這那之以較更最再已正將會要把讓給據稱道表示預計料帶動"
+    "受惠影響板塊消息新聞發布時間來源連結摘要利好邏輯股票香港港股恆指"
+    "今日昨日當前目前市場資金政策宏觀數據顯示預期維持持續進一步"
+    "a the of to in on for and or with is are was were be been has have"
 )
 
-# ========== 時區輔助 ==========
-def get_hkt_now() -> datetime:
+# 時間欄位禁止詞（出現即丟棄該條）
+TIME_FORBIDDEN_WORDS = [
+    "估計", "未詳", "約定", "不詳", "預計時間", "暫定", "待定",
+    "未提供", "未給出", "暫未", "不確定", "unknown",
+]
+
+
+# ============================================================
+# 配置加載
+# ============================================================
+DEFAULT_CONFIG = {
+    "gemini": {
+        "model": "gemini-2.5-flash",
+        "timeout_sec": 180,
+        "max_retries": 3,
+        "retry_wait_sec": 60,
+    },
+    "sessions": {
+        "morning": {"start": "07:00", "end": "10:00", "news_after": "last_trading_day_close"},
+        "midday": {"start": "11:00", "end": "13:00", "news_after": "today_06:00"},
+        "evening": {"start": "21:30", "end": "23:00", "news_after": "today_16:00"},
+    },
+    "grace_minutes": 30,
+    "scan": {"interval_min_min": 8, "interval_min_max": 10},
+    "filters": {
+        "max_stock_news": 5,
+    },
+    "dedup": {"cache_file": "push_cache.json", "expire_days": 2},
+    "feishu": {"card_title": "📊 港股新聞監控快訊", "card_color": "wathet"},
+}
+
+
+def load_config():
+    """加載 config.yaml，缺失欄位用默認值補齊"""
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                user_cfg = yaml.safe_load(f) or {}
+            # 淺層合併（兩層）
+            for key, val in user_cfg.items():
+                if isinstance(val, dict) and isinstance(cfg.get(key), dict):
+                    cfg[key].update(val)
+                else:
+                    cfg[key] = val
+        except Exception as e:
+            print(f"⚠️ 讀取 config.yaml 失敗，使用默認配置: {e}")
+    else:
+        print(f"⚠️ 找不到 config.yaml，使用默認配置")
+    return cfg
+
+
+# ============================================================
+# 時間工具
+# ============================================================
+def get_hkt_now():
     return datetime.now(HKT)
 
-def is_weekend() -> bool:
-    return get_hkt_now().weekday() >= 5
 
-# ========== 飛書推送 ==========
-def gen_feishu_sign(timestamp: str, secret: str) -> str:
+def is_weekend(hkt=None):
+    hkt = hkt or get_hkt_now()
+    return hkt.weekday() >= 5
+
+
+def get_session(hkt, config):
+    """判斷當前屬於邊個 session，返回 session name 或 None（含 grace 容錯）"""
+    grace = config.get("grace_minutes", 30)
+    for name, s in config["sessions"].items():
+        sh, sm = map(int, s["start"].split(":"))
+        eh, em = map(int, s["end"].split(":"))
+        start_dt = hkt.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end_dt = hkt.replace(hour=eh, minute=em, second=0, microsecond=0)
+        grace_end = end_dt + timedelta(minutes=grace)
+        if start_dt <= hkt <= grace_end:
+            return name
+    return None
+
+
+def is_session_over(session_name, hkt, config):
+    """判斷 session 係咪到結束時間（唔計 grace）"""
+    s = config["sessions"].get(session_name)
+    if not s:
+        return True
+    eh, em = map(int, s["end"].split(":"))
+    end_dt = hkt.replace(hour=eh, minute=em, second=0, microsecond=0)
+    return hkt >= end_dt
+
+
+def calc_news_after(session_name, hkt, config):
+    """計算新聞有效起始時間"""
+    if session_name is None:
+        return hkt - timedelta(hours=24)
+
+    na_type = config["sessions"][session_name]["news_after"]
+
+    if na_type == "last_trading_day_close":
+        # 週一追溯至週五，其餘日子尋日
+        days_back = 3 if hkt.weekday() == 0 else 1
+        base_date = (hkt - timedelta(days=days_back)).date()
+        return datetime(base_date.year, base_date.month, base_date.day, 16, 0, tzinfo=HKT)
+    elif na_type == "today_06:00":
+        return hkt.replace(hour=6, minute=0, second=0, microsecond=0)
+    elif na_type == "today_16:00":
+        return hkt.replace(hour=16, minute=0, second=0, microsecond=0)
+    else:
+        return hkt - timedelta(hours=24)
+
+
+def format_hkt(dt):
+    return dt.strftime("%Y-%m-%d %H:%M HKT")
+
+
+def get_time_injection(now_hkt, news_after, session_name):
+    """生成注入 prompt 嘅時間資訊"""
+    wd_cn = WEEKDAY_CN[now_hkt.weekday()]
+    wd_en = WEEKDAY_EN[now_hkt.weekday()]
+    session_names = {"morning": "早市時段（07:00-10:00）",
+                     "midday": "午市時段（11:00-13:00）",
+                     "evening": "晚間時段（21:30-23:00）"}
+    s_name = session_names.get(session_name, "測試模式")
+
+    return (
+        f"\n---\n"
+        f"【當前香港時間】{now_hkt.strftime('%Y-%m-%d')}（{wd_cn}）{now_hkt.strftime('%H:%M')} HKT\n"
+        f"【新聞有效時間範圍】{format_hkt(news_after)} 至 {format_hkt(now_hkt)}\n"
+        f"【掃描時段】{s_name}\n"
+        f"\n"
+        f"⚠️ 時效鐵律（必須嚴格遵守）：\n"
+        f"- 只輸出在上述「新聞有效時間範圍」內發布嘅新聞\n"
+        f"- 早於範圍嘅消息視為已消化，禁止輸出\n"
+        f"- ⏰ 發布時間必須係從聯網搜尋結果確認嘅真實時間\n"
+        f"- 禁止使用「估計」「未詳」「約定時間」「待定」等不確定表述\n"
+        f"- 時間無法確定嘅新聞直接捨棄，不要輸出\n"
+    )
+
+
+# ============================================================
+# 飛書推送
+# ============================================================
+def gen_feishu_sign(timestamp, secret):
     string_to_sign = f"{timestamp}\n{secret}"
-    hmac_code = hmac.new(
-        string_to_sign.encode("utf-8"),
-        digestmod=hashlib.sha256
-    ).digest()
+    hmac_code = hmac.new(string_to_sign.encode("utf-8"), digestmod=hashlib.sha256).digest()
     return base64.b64encode(hmac_code).decode("utf-8")
 
-def send_feishu(raw_text: str) -> int:
-    hkt_now = get_hkt_now()
-    date_str = hkt_now.strftime("%Y-%m-%d")
-    time_str = hkt_now.strftime("%Y-%m-%d %H:%M HKT")
+
+def send_feishu(raw_text, config):
+    fs = config["feishu"]
+    webhook = os.getenv("FEISHU_WEBHOOK", "")
+    secret = os.getenv("FEISHU_SECRET", "")
+    now_hkt = get_hkt_now()
+    date_str = now_hkt.strftime("%Y-%m-%d")
+    time_str = now_hkt.strftime("%Y-%m-%d %H:%M HKT")
+
+    if not webhook:
+        print("❌ FEISHU_WEBHOOK 未設置，跳過推送")
+        return -1
 
     payload = {
         "msg_type": "interactive",
         "card": {
             "config": {"wide_screen_mode": True},
             "header": {
-                "title": {"tag": "plain_text", "content": f"📊 港股新聞監控快訊 | {date_str}"},
-                "template": "wathet"
+                "title": {"tag": "plain_text", "content": f"{fs['card_title']} | {date_str}"},
+                "template": fs["card_color"],
             },
             "elements": [
-                {
-                    "tag": "div",
-                    "text": {"tag": "lark_md", "content": raw_text}
-                },
+                {"tag": "div", "text": {"tag": "lark_md", "content": raw_text}},
                 {"tag": "hr"},
-                {
-                    "tag": "note",
-                    "elements": [
-                        {"tag": "plain_text", "content": f"⏰ 推送時間：{time_str}"}
-                    ]
-                }
-            ]
-        }
+                {"tag": "note", "elements": [
+                    {"tag": "plain_text", "content": f"⏰ 推送時間：{time_str}"}
+                ]},
+            ],
+        },
     }
 
-    if FEISHU_SECRET:
+    if secret:
         ts = str(int(time.time()))
         payload["timestamp"] = ts
-        payload["sign"] = gen_feishu_sign(ts, FEISHU_SECRET)
+        payload["sign"] = gen_feishu_sign(ts, secret)
 
     for attempt in range(3):
         try:
-            r = requests.post(FEISHU_WEBHOOK, json=payload, timeout=30)
+            r = requests.post(webhook, json=payload, timeout=30)
             resp = r.json()
             if r.status_code == 200 and resp.get("code", 0) == 0:
-                print(f"飛書推送成功 (attempt {attempt+1})")
+                print(f"✅ 飛書推送成功 (attempt {attempt + 1})")
                 return 200
             else:
-                print(f"飛書推送失敗: status={r.status_code}, resp={resp}")
+                print(f"❌ 飛書推送失敗: status={r.status_code}, resp={resp}")
         except Exception as e:
-            print(f"飛書推送異常 (attempt {attempt+1}): {e}")
+            print(f"❌ 飛書推送異常 (attempt {attempt + 1}): {e}")
         if attempt < 2:
             time.sleep(3)
     return -1
 
-# ========== 文本後處理 ==========
-def format_links(text: str) -> str:
-    """將 URL 轉成 [點擊查看](url)；冇 URL 嘅空連結行直接移除"""
-    def replacer(m):
+
+# ============================================================
+# 文本處理
+# ============================================================
+def normalize_stock_codes(text):
+    """將所有股票代號統一為 5 位數字格式 0xxxx.HK"""
+    # HK.0xxxx → 0xxxx.HK
+    text = re.sub(r'HK\.(\d{1,5})(?!\d)', lambda m: f"{m.group(1).zfill(5)}.HK", text)
+    # 0xxxx.HK → 補零至 5 位
+    text = re.sub(r'(?<!\d)(\d{1,5})\.HK(?!\d)', lambda m: f"{m.group(1).zfill(5)}.HK", text)
+    return text
+
+
+def format_links(text):
+    """將 URL 轉為 [點擊查看](url)，空連結行移除"""
+    # 先處理 🔗 連結：後跟 URL（可能跨行）
+    def link_replacer(m):
         urls = re.findall(r'https?://[^\s\)\]]+', m.group(0))
         if urls:
             return f"🔗 連結：[點擊查看]({urls[0]})"
-        return ""
+        return ""  # 冇 URL → 移除成行
+
     pattern = r'🔗 連結：[\s\S]*?(?=\n[💡🏷️📰⏰📌]|\n===|\Z)'
-    text = re.sub(pattern, replacer, text)
+    text = re.sub(pattern, link_replacer, text)
+
+    # 將殘留嘅 raw URL 都轉成 [點擊查看]
+    def raw_url_replacer(m):
+        return f"[點擊查看]({m.group(0)})"
+    text = re.sub(r'(?<![\(\]])https?://[^\s\)\]]+', raw_url_replacer, text)
+
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
-def convert_all_raw_urls(text: str) -> str:
-    """最後防線：將所有殘留嘅 raw URL 強制轉成 [點擊查看](url)"""
-    def replacer(m):
-        url = m.group(0)
-        return f"[點擊查看]({url})"
-    text = re.sub(r'(?<![\(])https?://[^\s\)\]]+', replacer, text)
-    return text
 
-def append_grounding_source(text: str, grounding_urls: list) -> str:
-    """如果文本冇任何連結，附加一個 Gemini 聯網搜尋來源 URL（確保有來源可追溯，防幻覺）"""
-    if not grounding_urls:
-        return text
-    if "點擊查看" in text:
-        return text
-    title, uri = grounding_urls[0]
-    text += f"\n\n---\n📎 參考來源：[點擊查看]({uri})"
-    return text
+# ============================================================
+# 快取與去重
+# ============================================================
+def cache_path(config):
+    return SCRIPT_DIR / config["dedup"]["cache_file"]
 
-def normalize_stock_code(raw_code: str) -> str:
-    """將 HK.09988 或 09988.HK 統一標準化為 09988.HK"""
-    digits_match = re.search(r"\d{4,5}", raw_code)
-    if digits_match:
-        return f"{digits_match.group(0)}.HK"
-    return "UNKNOWN"
 
-# ========== 鎖與快取 ==========
-def load_cache():
-    if not os.path.exists(CACHE_FILE):
+def load_cache(config):
+    path = cache_path(config)
+    if not path.exists():
         try:
-            with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump({"pushed": []}, f, ensure_ascii=False, indent=2)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"stock": {}, "macro": {}}, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"創建緩存文件失敗: {e}")
-        return {"pushed": []}
+            print(f"⚠️ 創建快取失敗: {e}")
+        return {"stock": {}, "macro": {}}
     try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if "stock" not in data:
+                data["stock"] = {}
+            if "macro" not in data:
+                data["macro"] = {}
+            return data
     except Exception:
-        return {"pushed": []}
+        return {"stock": {}, "macro": {}}
 
-def save_cache(cache_data):
+
+def save_cache(cache, config):
     try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+        with open(cache_path(config), "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"寫入緩存失敗: {e}")
+        print(f"⚠️ 寫入快取失敗: {e}")
 
-def acquire_lock() -> bool:
+
+def cleanup_cache(cache, config):
+    """清除過期記錄"""
+    expire_days = config["dedup"]["expire_days"]
+    cutoff = (get_hkt_now() - timedelta(days=expire_days)).strftime("%Y-%m-%d")
+    total_expired = 0
+    for section in ["stock", "macro"]:
+        expired = [k for k in cache[section] if k < cutoff]
+        for k in expired:
+            del cache[section][k]
+        total_expired += len(expired)
+    if total_expired:
+        print(f"🧹 清除 {total_expired} 條過期快取")
+
+
+# 板塊主題關鍵詞組（同一組內嘅新聞視為相關主題）
+MACRO_TOPIC_GROUPS = [
+    {"油價", "原油", "布油", "美油", "石油", "霍爾木茲", "中東", "地緣",
+     "停火", "美伊", "以色列", "伊朗", "也門", "海峽", "煉油", "天然氣"},
+    {"加息", "減息", "降準", "利率", "美聯儲", "聯儲", "央行", "逆回購",
+     "流動性", "通脹", "通膨", "CPI", "PPI", "寬鬆", "貨幣政策"},
+    {"內房", "地產", "房企", "樓市", "房地產", "住房", "物業"},
+    {"人工智能", "芯片", "半導體", "晶圓", "算力", "大模型", "AI",
+     "GPU", "英偉達", "輝達", "NVIDIA"},
+    {"新能源車", "電動車", "比亞迪", "充電", "鋰電", "光伏"},
+    {"關稅", "貿易戰", "制裁", "出口管制", "貿易壁壘"},
+]
+
+
+def extract_keywords(text):
+    """從標題提取關鍵詞（中文 bigram + trigram + 英文）"""
+    cleaned = re.sub(r'[^\w\u4e00-\u9fff]', ' ', text)
+    keywords = set()
+    # 英文單詞
+    for w in re.findall(r'[a-zA-Z]{2,}', cleaned):
+        wl = w.lower()
+        if wl not in MACRO_STOP_WORDS:
+            keywords.add(wl)
+    # 中文 bigram + trigram
+    for segment in re.findall(r'[\u4e00-\u9fff]+', cleaned):
+        for i in range(len(segment) - 1):
+            bg = segment[i:i + 2]
+            if bg not in MACRO_STOP_WORDS:
+                keywords.add(bg)
+        for i in range(len(segment) - 2):
+            keywords.add(segment[i:i + 3])
+    return keywords
+
+
+def _topic_group(text):
+    """返回文本命中嘅主題組 index，無命中返回 -1"""
+    for i, group in enumerate(MACRO_TOPIC_GROUPS):
+        if any(kw in text for kw in group):
+            return i
+    return -1
+
+
+def is_duplicate_macro(title, macro_cache, date_str):
+    """檢查板塊消息係咪同一主題（bigram 重疊 ≥ 40% 且 ≥3 個，或同主題組 ≥25%）"""
+    new_kw = extract_keywords(title)
+    if not new_kw:
+        return False
+    new_topic = _topic_group(title)
+    existing = macro_cache.get(date_str, [])
+    for old_kw_list in existing:
+        old_kw = set(old_kw_list)
+        if not old_kw:
+            continue
+        overlap = new_kw & old_kw
+        min_len = min(len(new_kw), len(old_kw))
+        ratio = len(overlap) / min_len if min_len > 0 else 0
+        # 標準：重疊 ≥ 3 個且比例 ≥ 40%
+        if len(overlap) >= 3 and ratio >= 0.4:
+            return True
+        # 同主題組放寬：重疊 ≥ 2 個且比例 ≥ 25%
+        if new_topic >= 0 and len(overlap) >= 2 and ratio >= 0.25:
+            return True
+    return False
+
+
+def add_macro_keyword(title, macro_cache, date_str):
+    kw = list(extract_keywords(title))
+    if kw:
+        macro_cache.setdefault(date_str, []).append(kw)
+
+
+# ============================================================
+# 進程鎖
+# ============================================================
+def acquire_lock():
     now_ts = time.time()
-    if os.path.exists(LOCK_FILE):
+    if LOCK_FILE.exists():
         try:
-            with open(LOCK_FILE, "r") as f:
-                ts = float(f.read().strip())
-            if (now_ts - ts) > 12 * 60:
-                os.unlink(LOCK_FILE)
+            ts = float(LOCK_FILE.read_text().strip())
+            if (now_ts - ts) > 30 * 60:  # 30 分鐘過期
+                LOCK_FILE.unlink()
             else:
                 return False
         except Exception:
             try:
-                os.unlink(LOCK_FILE)
+                LOCK_FILE.unlink()
             except Exception:
                 pass
     try:
-        with open(LOCK_FILE, "w") as f:
-            f.write(str(now_ts))
+        LOCK_FILE.write_text(str(now_ts))
         return True
     except Exception:
         return False
 
+
 def release_lock():
     try:
-        if os.path.exists(LOCK_FILE):
-            os.unlink(LOCK_FILE)
+        if LOCK_FILE.exists():
+            LOCK_FILE.unlink()
     except Exception:
         pass
 
-# ========== 時間窗口判斷（寬鬆容錯，防止 cron 延遲漏報）==========
-def get_run_mode():
-    hkt = get_hkt_now()
-    h, m = hkt.hour, hkt.minute
-    # 長駐時段 08:00-13:59（實際結束由 is_long_run_time_over 控制）
-    if 8 <= h < 14:
-        return "long_run"
-    # 15:00 / 15:50 one_shot，容錯至 16:15
-    if h == 15 or (h == 16 and m <= 15):
-        return "one_shot"
-    # 22:00 one_shot，容錯至 23:15
-    if h == 22 or (h == 23 and m <= 15):
-        return "one_shot"
-    return "none"
 
-def is_long_run_time_over():
-    """判斷當前是否應該結束長駐迴圈（正區分早上/中午兩個時段）"""
-    hkt = get_hkt_now()
-    h, m = hkt.hour, hkt.minute
-    # 早上時段結束：10:00-10:59
-    if 10 <= h < 11:
-        return True
-    # 中午時段結束：13:31 之後
-    if h >= 14 or (h == 13 and m > 30):
-        return True
-    return False
-
-# ========== Gemini 調用（含超時 + 429重試 + grounding URL 提取）==========
-def is_retryable_error(e: Exception) -> bool:
-    err_str = str(e).lower()
-    return any(kw in err_str for kw in [
+# ============================================================
+# Gemini 調用
+# ============================================================
+def is_retryable_error(e):
+    err = str(e).lower()
+    return any(kw in err for kw in [
         "429", "rate limit", "rate_limit", "resource exhausted",
         "resource_exhausted", "quota", "too many requests",
-        "timeout", "timed out", "deadline exceeded", "503", "502", "500"
+        "timeout", "timed out", "deadline exceeded",
+        "503", "502", "500", "unavailable",
     ])
 
-def extract_grounding_urls(response) -> list:
-    """從 Gemini response 嘅 grounding metadata 提取聯網搜尋來源 URL"""
+
+def extract_grounding_urls(response):
+    """提取 grounding metadata 嘅真實來源 URL"""
     urls = []
     try:
         if not response.candidates:
             return urls
-        candidate = response.candidates[0]
-        metadata = getattr(candidate, 'grounding_metadata', None)
-        if not metadata:
+        meta = getattr(response.candidates[0], "grounding_metadata", None)
+        if not meta:
             return urls
-        chunks = getattr(metadata, 'grounding_chunks', None)
+        chunks = getattr(meta, "grounding_chunks", None)
         if not chunks:
             return urls
         for chunk in chunks:
-            web = getattr(chunk, 'web', None)
+            web = getattr(chunk, "web", None)
             if web:
-                uri = getattr(web, 'uri', '')
-                title = getattr(web, 'title', '來源')
+                uri = getattr(web, "uri", "")
+                title = getattr(web, "title", "來源")
                 if uri:
                     urls.append((title, uri))
     except Exception as e:
-        print(f"提取 grounding URL 失敗: {e}")
+        print(f"⚠️ 提取 grounding URL 失敗: {e}")
     return urls
 
-def gemini_call(prompt: str, max_retries: int = 3):
-    """返回 (text, grounding_urls)"""
-    for attempt in range(max_retries):
+
+def gemini_call(prompt, config):
+    """調用 Gemini，返回 (text, grounding_urls)"""
+    gcfg = config["gemini"]
+    client = genai.Client(
+        api_key=os.getenv("GEMINI_API_KEY", ""),
+        http_options=types.HttpOptions(timeout=gcfg["timeout_sec"] * 1000),
+    )
+    gen_config = types.GenerateContentConfig(
+        temperature=0.1,
+        tools=[types.Tool(google_search=types.GoogleSearch())],
+    )
+
+    for attempt in range(gcfg["max_retries"]):
         try:
-            chat = CLIENT.chats.create(
-                model=MODEL_NAME,
-                config=GEMINI_CONFIG
-            )
+            chat = client.chats.create(model=gcfg["model"], config=gen_config)
             response = chat.send_message(prompt)
-            grounding_urls = extract_grounding_urls(response)
-            return response.text, grounding_urls
+            grounding = extract_grounding_urls(response)
+            return response.text or "", grounding
         except Exception as e:
-            if is_retryable_error(e) and attempt < max_retries - 1:
-                wait_sec = 60
-                print(f"⚠️ Gemini 調用失敗（429/超時/暫時性錯誤），等待 {wait_sec} 秒後重試 "
-                      f"({attempt+1}/{max_retries}): {str(e)[:100]}")
-                time.sleep(wait_sec)
+            if is_retryable_error(e) and attempt < gcfg["max_retries"] - 1:
+                wait = gcfg["retry_wait_sec"]
+                print(f"⚠️ Gemini 調用失敗（429/超時/暫時性），{wait}s 後重試 "
+                      f"({attempt + 1}/{gcfg['max_retries']}): {str(e)[:120]}")
+                time.sleep(wait)
             else:
                 raise
 
-# ========== 核心掃描 ==========
-def scan_once(include_macro: bool = True, macro_pushed_set=None):
-    cache = load_cache()
-    pushed_set = set(cache.get("pushed", []))
 
-    rank_instruction = (
-        "\n\n【重要】個股新聞必須按對股價嘅刺激力度（爆發力）由強到弱排序，"
-        "最強嘅排第一，最多輸出5條。"
-    )
+# ============================================================
+# 新聞解析
+# ============================================================
+def split_sections(text):
+    """將 Gemini 回應切分為 (macro_text, stock_text)"""
+    macro_text = ""
+    stock_text = ""
 
-    if include_macro:
-        prompt = SYSTEM_PROMPT + rank_instruction + "\n\n【當前掃描模式：模式A — 首輪/定時掃描，請完整輸出板塊+個股】"
-    else:
-        prompt = SYSTEM_PROMPT + rank_instruction + "\n\n【當前掃描模式：模式B — 盤中輪詢掃描，重點輸出個股；僅突發黑天鵝先出板塊】"
+    macro_marker = "=== 【板塊宏觀消息】 ==="
+    stock_marker = None
+    for marker in ["=== 【個股重大利好】 ===", "=== 【個股重大利好/異動】 ==="]:
+        if marker in text:
+            stock_marker = marker
+            break
 
-    llm_result, grounding_urls = gemini_call(prompt)
-    print("=== Gemini output ===")
-    print(llm_result)
-    if grounding_urls:
-        print(f"=== Grounding 來源: {len(grounding_urls)} 個 URL ===")
+    if stock_marker and macro_marker in text:
+        parts = text.split(stock_marker)
+        stock_text = parts[1] if len(parts) > 1 else ""
+        macro_parts = parts[0].split(macro_marker)
+        macro_text = macro_parts[1] if len(macro_parts) > 1 else ""
+    elif stock_marker:
+        parts = text.split(stock_marker)
+        stock_text = parts[1] if len(parts) > 1 else ""
+    elif macro_marker:
+        parts = text.split(macro_marker)
+        macro_text = parts[1] if len(parts) > 1 else ""
 
-    # 檢查有冇實質內容
-    has_news_emoji = "📰" in llm_result
-    has_macro_section = "【板塊宏觀消息】" in llm_result
-    has_stock_section = "【個股重大利好" in llm_result
-    has_section = has_macro_section or has_stock_section
-    explicit_no_news = any(kw in llm_result for kw in [
+    return macro_text.strip(), stock_text.strip()
+
+
+def parse_entries(section_text):
+    """以 📰 為邊界切分逐條新聞"""
+    if not section_text or "📰" not in section_text:
+        return []
+    raw_entries = re.split(r'(?=📰)', section_text)
+    entries = []
+    for e in raw_entries:
+        e = e.strip()
+        if e and "📰" in e:
+            entries.append(e)
+    return entries
+
+
+def extract_field(entry, emoji):
+    """提取某個 emoji 欄位嘅內容"""
+    pattern = rf'{emoji}\s*[^\n：:]*[：:]\s*([^\n]*)'
+    m = re.search(pattern, entry)
+    return m.group(1).strip() if m else ""
+
+
+def extract_url_from_entry(entry):
+    """從條目入面提取 URL"""
+    urls = re.findall(r'https?://[^\s\)\]]+', entry)
+    return urls[0] if urls else ""
+
+
+def parse_entry_time(entry):
+    """
+    解析 ⏰ 欄位嘅時間，返回 (datetime, is_valid)
+    is_valid=False 表示時間含禁止詞或無法解析
+    """
+    time_line = ""
+    m = re.search(r'⏰[^\n]*', entry)
+    if m:
+        time_line = m.group(0)
+
+    # 檢查禁止詞
+    for word in TIME_FORBIDDEN_WORDS:
+        if word in time_line:
+            return None, False
+
+    # 提取日期時間
+    dt_match = re.search(r'(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})', time_line)
+    if dt_match:
+        try:
+            y, mo, d, h, mi = map(int, dt_match.groups())
+            return datetime(y, mo, d, h, mi, tzinfo=HKT), True
+        except ValueError:
+            return None, False
+
+    return None, False
+
+
+def is_no_news(text):
+    """檢查回應係咪表示「無新聞」"""
+    markers = [
         "無符合條件", "冇符合條件", "无符合条件",
         "無具催化力", "无具催化力",
-        "沒有符合條件", "没有符合条件"
-    ])
+        "沒有符合條件", "没有符合条件",
+        "無重大", "无重大", "冇重大",
+    ]
+    return any(kw in text for kw in markers)
 
-    if not has_news_emoji and not has_section:
-        print("無任何新聞內容，唔推送飛書")
-        return
 
-    if explicit_no_news and not has_news_emoji:
-        print("當前時段無符合條件之重大消息，唔推送飛書")
-        return
+# ============================================================
+# 核心掃描
+# ============================================================
+def scan_once(session_name, turn_count, macro_pushed, config, prompts):
+    """
+    執行一次掃描
+    prompts: (macro_prompt, stock_prompt)
+    返回 True 表示有推送
+    """
+    macro_prompt, stock_prompt = prompts
+    now_hkt = get_hkt_now()
+    date_str = now_hkt.strftime("%Y-%m-%d")
+    news_after = calc_news_after(session_name, now_hkt, config)
+    cache = load_cache(config)
+    cleanup_cache(cache, config)
 
-    # 兜底：有區塊標題但冇 📰（Gemini 冇跟格式），提取內容原樣推送
-    if has_section and not has_news_emoji:
-        print("⚠️ Gemini 冇跟從輸出格式，提取內容原樣推送")
-        start_candidates = []
-        if has_macro_section:
-            start_candidates.append(llm_result.find("【板塊宏觀消息】"))
-        if has_stock_section:
-            start_candidates.append(llm_result.find("【個股重大利好"))
-        start_idx = min(i for i in start_candidates if i >= 0)
-        raw_content = llm_result[start_idx:]
-        raw_content = re.sub(r'\n*當前時段[^。\n]*(?:之重大利好|之板塊消息)\s*$', '', raw_content).strip()
-        if raw_content:
-            raw_content = format_links(raw_content)
-            raw_content = append_grounding_source(raw_content, grounding_urls)
-            raw_content = convert_all_raw_urls(raw_content)
-            send_feishu(raw_content)
-        else:
-            print("兜底提取後內容為空，唔推送")
-        return
+    # 組裝 prompt
+    time_info = get_time_injection(now_hkt, news_after, session_name)
 
-    # 正常格式解析
-    macro_part = ""
-    stock_part = ""
-    if "=== 【個股重大利好" in llm_result:
-        split_marker = "=== 【個股重大利好/異動】 ===" if "=== 【個股重大利好/異動】 ===" in llm_result else "=== 【個股重大利好】 ==="
-        parts = llm_result.split(split_marker)
-        stock_part = parts[1] if len(parts) > 1 else ""
-        if "=== 【板塊宏觀消息】 ===" in parts[0]:
-            macro_parts = parts[0].split("=== 【板塊宏觀消息】 ===")
-            macro_part = macro_parts[1] if len(macro_parts) > 1 else ""
-    elif "=== 【板塊宏觀消息】 ===" in llm_result:
-        macro_parts = llm_result.split("=== 【板塊宏觀消息】 ===")
-        macro_part = macro_parts[1] if len(macro_parts) > 1 else ""
+    if turn_count == 1 and macro_prompt:
+        # 第一輪：板塊 + 個股
+        prompt = (
+            f"{macro_prompt}\n\n---\n\n{stock_prompt}"
+            f"{time_info}"
+            f"\n【掃描模式】首輪掃描，請先輸出「=== 【板塊宏觀消息】 ===」，"
+            f"再輸出「=== 【個股重大利好】 ===」。"
+        )
+        print("📡 第一輪掃描（板塊+個股）")
+    else:
+        # 後續輪：只掃個股
+        prompt = (
+            f"{stock_prompt}"
+            f"{time_info}"
+            f"\n【掃描模式】盤中輪詢掃描，只輸出「=== 【個股重大利好】 ===」部分。"
+            f"若盤中出現突發黑天鵝級宏觀事件（如突發戰爭、突發降準、重磅監管轉向），"
+            f"可在最前面輸出「=== 【板塊宏觀消息】 ===」緊急警報；若無則不要輸出板塊區塊。"
+        )
+        print(f"📡 第 {turn_count} 輪掃描（只掃個股）")
 
-    # 板塊消息逐條解析 + 同一 job 內去重
+    # 調用 Gemini
+    llm_result, grounding_urls = gemini_call(prompt, config)
+    print(f"=== Gemini 回應 ({len(llm_result)} 字元) ===")
+    print(llm_result[:2000])
+    if len(llm_result) > 2000:
+        print(f"...（省略 {len(llm_result) - 2000} 字元）")
+    if grounding_urls:
+        print(f"🔗 Grounding 來源: {len(grounding_urls)} 個 URL")
+
+    # 檢查有冇實質內容
+    has_section = "【板塊宏觀消息】" in llm_result or "【個股重大利好" in llm_result
+    has_news_emoji = "📰" in llm_result
+
+    if not has_section and not has_news_emoji:
+        print("ℹ️ 無任何新聞內容，唔推送")
+        return False
+
+    if is_no_news(llm_result) and not has_news_emoji:
+        print("ℹ️ 當前時段無符合條件之重大消息，唔推送")
+        return False
+
+    # 標準化股票代號
+    llm_result = normalize_stock_codes(llm_result)
+
+    # 切分區塊
+    macro_text, stock_text = split_sections(llm_result)
+
+    # 準備真實來源 URL（grounding metadata）
+    real_urls = [uri for _, uri in grounding_urls if "vertexaisearch" not in uri]
+    if not real_urls:
+        real_urls = [uri for _, uri in grounding_urls]
+    url_idx = 0
+
+    def get_url_for_entry(entry_text):
+        """優先用文本入面嘅 URL，否則用 grounding URL"""
+        nonlocal url_idx
+        url = extract_url_from_entry(entry_text)
+        # 如果係超長 redirect URL，優先用 grounding 真實 URL
+        if url and "vertexaisearch" not in url and len(url) < 300:
+            return url
+        if url_idx < len(real_urls):
+            u = real_urls[url_idx]
+            url_idx += 1
+            return u
+        return url  # fallback
+
+    # ---- 板塊消息處理 ----
     macro_entries = []
-    if macro_part.strip() and "📰" in macro_part:
-        macro_raw_entries = re.split(r'(?=📰)', macro_part.strip())
-        for entry in macro_raw_entries:
-            entry = entry.strip()
-            if not entry or "📰" not in entry:
-                continue
-            title_match = re.search(r"📰 新聞標題：([^\n]+)", entry)
-            title = title_match.group(1).strip() if title_match else entry[:50]
-            if macro_pushed_set is not None:
-                if title in macro_pushed_set:
-                    print(f"已過濾重複板塊消息: {title}")
-                    continue
-                macro_pushed_set.add(title)
-            macro_entries.append(entry)
+    macro_raw = parse_entries(macro_text)
+    for entry in macro_raw:
+        title = extract_field(entry, "📰 新聞標題") or entry[:60]
 
-    final_macro_text = "\n\n".join(macro_entries).strip()
-    macro_has_news = len(macro_entries) > 0
-
-    # 個股逐條解析 + 跨 job 持久化去重
-    filtered_stock_entries = []
-    stock_entries = re.split(r'(?=📰)', stock_part.strip())
-
-    for entry in stock_entries:
-        entry = entry.strip()
-        if not entry or "📰" not in entry:
+        # 時間驗證
+        news_time, valid = parse_entry_time(entry)
+        if not valid:
+            print(f"🚫 板塊消息時間不明/含禁止詞，丟棄: {title[:40]}")
+            continue
+        if news_time and (news_time < news_after or news_time > now_hkt + timedelta(minutes=10)):
+            print(f"🚫 板塊消息超出時間範圍，丟棄: {title[:40]} ({format_hkt(news_time)})")
             continue
 
-        title_match = re.search(r"📰 新聞標題：([^\n]+)", entry)
-        stock_match = re.search(r"🏷️ 股票：.*?(HK\.\d{4,5}|\d{4,5}\.HK)", entry, re.DOTALL)
+        # 主題去重
+        if is_duplicate_macro(title, cache["macro"], date_str):
+            print(f"🔁 板塊消息主題重複，跳過: {title[:40]}")
+            continue
+        # 同時檢查 job 內去重
+        if title in macro_pushed:
+            print(f"🔁 板塊消息本 session 已推送，跳過: {title[:40]}")
+            continue
 
-        title = title_match.group(1).strip() if title_match else ""
-        code = normalize_stock_code(stock_match.group(1)) if stock_match else "UNKNOWN"
+        # 加入連結
+        url = get_url_for_entry(entry)
+        if url:
+            entry = re.sub(
+                r'🔗 連結：[\s\S]*?(?=\n[💡🏷️📰⏰📌]|\Z)',
+                f"🔗 連結：{url}",
+                entry,
+                flags=re.MULTILINE,
+            )
 
-        key = f"{code}||{title}"
-        if key not in pushed_set:
-            pushed_set.add(key)
-            filtered_stock_entries.append(entry)
-        else:
-            print(f"已過濾重複新聞: {key}")
+        macro_entries.append(entry)
+        macro_pushed.add(title)
+        add_macro_keyword(title, cache["macro"], date_str)
 
-    # ✅ 硬上限：最多 5 條（已按爆發力排序，頭5條最強）
-    if len(filtered_stock_entries) > MAX_STOCK_NEWS:
-        print(f"⚠️ Gemini 輸出 {len(filtered_stock_entries)} 條，截斷至 {MAX_STOCK_NEWS} 條（保留爆發力最強嘅頭5條）")
-        filtered_stock_entries = filtered_stock_entries[:MAX_STOCK_NEWS]
+    # ---- 個股消息處理 ----
+    stock_entries = []
+    stock_raw = parse_entries(stock_text)
+    filters = config["filters"]
 
-    final_stock_text = "\n\n".join(filtered_stock_entries).strip()
-    stock_has_news = len(filtered_stock_entries) > 0
+    for entry in stock_raw:
+        title = extract_field(entry, "📰 新聞標題") or entry[:60]
+        stock_field = extract_field(entry, "🏷️ 股票")
 
-    if not macro_has_news and not stock_has_news:
-        print("篩選後無新發布之實質新聞，唔推送飛書")
-        return
+        # 必須有股票代號
+        code_match = re.search(r'(\d{5})\.HK', stock_field)
+        if not code_match:
+            # 嘗試從全文搵
+            code_match = re.search(r'(\d{5})\.HK', entry)
+        if not code_match:
+            print(f"🚫 搵唔到股票代號，丟棄: {title[:40]}")
+            continue
+        code = f"{code_match.group(1)}.HK"
 
-    # 組裝推送內容
-    final_out = []
-    if macro_has_news:
-        final_out.append("=== 【板塊宏觀消息】 ===")
-        final_out.append(final_macro_text)
-    if stock_has_news:
-        final_out.append("=== 【個股重大利好】 ===")
-        final_out.append(final_stock_text)
+        # 時間驗證
+        news_time, valid = parse_entry_time(entry)
+        if not valid:
+            print(f"🚫 {code} 時間不明/含禁止詞，丟棄: {title[:40]}")
+            continue
+        if news_time and (news_time < news_after or news_time > now_hkt + timedelta(minutes=10)):
+            print(f"🚫 {code} 超出時間範圍，丟棄: {title[:40]} ({format_hkt(news_time)})")
+            continue
 
-    final_text = "\n\n".join(final_out)
+        # 跨 job 去重：代號+日期
+        dedup_key = f"{code}|{date_str}"
+        if dedup_key in cache["stock"]:
+            print(f"🔁 {code} 今日已推送過，跳過: {title[:40]}")
+            continue
+
+        # 加入連結
+        url = get_url_for_entry(entry)
+        if url:
+            entry = re.sub(
+                r'🔗 連結：[\s\S]*?(?=\n[💡🏷️📰⏰📌]|\Z)',
+                f"🔗 連結：{url}",
+                entry,
+                flags=re.MULTILINE,
+            )
+
+        stock_entries.append(entry)
+        cache["stock"][dedup_key] = title[:100]
+
+    # 硬上限
+    max_news = filters["max_stock_news"]
+    if len(stock_entries) > max_news:
+        print(f"⚠️ 個股新聞 {len(stock_entries)} 條，截斷至 {max_news} 條")
+        stock_entries = stock_entries[:max_news]
+
+    macro_has = len(macro_entries) > 0
+    stock_has = len(stock_entries) > 0
+
+    print(f"📊 解析結果：板塊 {len(macro_entries)} 條，個股 {len(stock_entries)} 條")
+
+    if not macro_has and not stock_has:
+        print("ℹ️ 篩選後無新內容，唔推送")
+        save_cache(cache, config)
+        return False
+
+    # 組裝
+    parts = []
+    if macro_has:
+        parts.append("=== 【板塊宏觀消息】 ===")
+        parts.append("\n\n".join(macro_entries))
+    if stock_has:
+        parts.append("=== 【個股重大利好】 ===")
+        parts.append("\n\n".join(stock_entries))
+
+    final_text = "\n\n".join(parts)
     final_text = format_links(final_text)
-    final_text = append_grounding_source(final_text, grounding_urls)
-    final_text = convert_all_raw_urls(final_text)
-    send_feishu(final_text)
+    send_feishu(final_text, config)
+    save_cache(cache, config)
+    return True
 
-    cache["pushed"] = list(pushed_set)
-    save_cache(cache)
 
-# ========== 主流程 ==========
+# ============================================================
+# 主流程
+# ============================================================
 def main():
-    hkt_now = get_hkt_now()
-    print(f"HKT now: {hkt_now.strftime('%Y-%m-%d %H:%M:%S')}")
+    config = load_config()
+    now_hkt = get_hkt_now()
+    force_run = os.getenv("FORCE_RUN", "false").lower() == "true"
 
-    if FORCE_RUN:
+    print("=" * 60)
+    print(f"=== HKT 現在時間: {now_hkt.strftime('%Y-%m-%d %H:%M:%S')} "
+          f"{WEEKDAY_CN[now_hkt.weekday()]} ({WEEKDAY_EN[now_hkt.weekday()]}) ===")
+    print("=" * 60)
+
+    # 讀取 prompt variables
+    macro_prompt = os.getenv("HK_NEWS_PROMPT_MACRO", "").strip()
+    stock_prompt = os.getenv("HK_NEWS_PROMPT_STOCK", "").strip()
+
+    if not stock_prompt:
+        print("❌ HK_NEWS_PROMPT_STOCK 未設置，請喺 GitHub Variables 配置")
+        sys.exit(1)
+    if not macro_prompt:
+        print("⚠️ HK_NEWS_PROMPT_MACRO 未設置，板塊消息將被跳過")
+
+    if force_run:
         print("⚠️ FORCE_RUN 模式：忽略週末同時間窗口，即時跑一次")
+        session_name = None
         run_mode = "one_shot"
     else:
-        if is_weekend():
-            print("週末，退出")
+        if is_weekend(now_hkt):
+            print("ℹ️ 週末，退出")
             return
-        run_mode = get_run_mode()
-        print(f"運行模式: {run_mode}")
-        if run_mode == "none":
-            print("不在執行窗口，退出")
+        session_name = get_session(now_hkt, config)
+        if not session_name:
+            print("ℹ️ 唔在任何執行窗口，退出")
             return
+        run_mode = "long_run"
+        s = config["sessions"][session_name]
+        news_after = calc_news_after(session_name, now_hkt, config)
+        print(f"=== Session: {session_name} ({s['start']}-{s['end']}) ===")
+        print(f"=== 新聞有效範圍: {format_hkt(news_after)} ~ {format_hkt(now_hkt)} ===")
 
     if not acquire_lock():
-        print("已有另一個實例正在執行，跳過")
+        print("⚠️ 已有另一個實例在執行，跳過")
         return
 
     try:
         if run_mode == "one_shot":
-            print("one-shot模式，執行一次完整掃描（板塊+個股）")
-            scan_once(include_macro=True)
+            scan_once(session_name, 1, set(), config, (macro_prompt, stock_prompt))
 
         elif run_mode == "long_run":
-            print("長駐模式：第一輪跑板塊+個股，後續輪次重點跑個股（突發黑天鵝仍會出板塊警報）")
-            first_round = True
+            turn = 0
             macro_pushed = set()
-            while True:
-                # ✅ 先執行掃描，再檢查時間——確保即使 cron 延遲啟動都最少跑一次
-                try:
-                    scan_once(include_macro=first_round, macro_pushed_set=macro_pushed)
-                    first_round = False
-                except Exception as e:
-                    print(f"本輪掃描發生異常，跳過本輪：{str(e)}")
-                    first_round = False
+            scan_cfg = config["scan"]
 
-                if is_long_run_time_over():
-                    print("已到長駐結束時間，退出迴圈，job完結")
+            while True:
+                turn += 1
+                turn_start = get_hkt_now()
+                print(f"\n{'─' * 50}")
+                print(f"--- Turn {turn} | {turn_start.strftime('%H:%M:%S')} HKT ---")
+                print(f"{'─' * 50}")
+
+                try:
+                    scan_once(session_name, turn, macro_pushed, config,
+                              (macro_prompt, stock_prompt))
+                except Exception as e:
+                    print(f"❌ 本輪異常，跳過: {str(e)[:200]}")
+
+                # 檢查係咪到結束時間
+                now_check = get_hkt_now()
+                if is_session_over(session_name, now_check, config):
+                    print(f"\n🏁 已到 session 結束時間 "
+                          f"({config['sessions'][session_name]['end']})，退出迴圈")
                     break
 
-                sleep_sec = random.randint(8 * 60, 10 * 60)
-                print(f"本輪完成，休眠 {sleep_sec} 秒後下一輪掃描")
+                # 隨機休眠
+                sleep_sec = random.randint(
+                    scan_cfg["interval_min_min"] * 60,
+                    scan_cfg["interval_min_max"] * 60,
+                )
+                next_run = get_hkt_now() + timedelta(seconds=sleep_sec)
+                print(f"💤 本輪完成，休眠 {sleep_sec // 60} 分 {sleep_sec % 60} 秒，"
+                      f"下一輪約 {next_run.strftime('%H:%M')} HKT")
                 time.sleep(sleep_sec)
+
     finally:
         release_lock()
+
 
 if __name__ == "__main__":
     main()
