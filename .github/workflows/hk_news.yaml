@@ -1,17 +1,13 @@
-name: HK News Monitor
+name: HK Stock News Monitor v2
 
 on:
   schedule:
-    # HKT 08:01 → UTC 00:01 長駐job啟動（程式內跑到10:00退出）
-    - cron: '1 0 * * 1-5'
-    # HKT 11:02 → UTC 03:02 長駐job啟動（程式內跑到13:30退出）
+    # HKT 07:02 → UTC 23:02（前日）週日至四 = 週一至五 HKT
+    - cron: '2 23 * * 0-4'
+    # HKT 11:02 → UTC 03:02 週一至五
     - cron: '2 3 * * 1-5'
-    # HKT 15:01 → UTC 07:01 一次性
-    - cron: '1 7 * * 1-5'
-    # HKT 15:52 → UTC 07:52 一次性
-    - cron: '52 7 * * 1-5'
-    # HKT 22:01 → UTC 14:01 一次性
-    - cron: '1 14 * * 1-5'
+    # HKT 21:32 → UTC 13:32 週一至五
+    - cron: '32 13 * * 1-5'
 
   workflow_dispatch:
     inputs:
@@ -24,9 +20,10 @@ on:
 jobs:
   news_scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
+
     concurrency:
-      group: hk-news-monitor
+      group: hk-news-monitor-v2
       cancel-in-progress: true
 
     steps:
@@ -42,18 +39,19 @@ jobs:
         uses: actions/cache@v4
         with:
           path: push_cache.json
-          key: hk-news-cache-${{ github.run_id }}
-          restore-keys: hk-news-cache-
+          key: hk-news-v2-${{ github.run_id }}
+          restore-keys: |
+            hk-news-v2-
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Run news monitor
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
-          HK_NEWS_PROMPT: ${{ vars.HK_NEWS_PROMPT }}
+          HK_NEWS_PROMPT_MACRO: ${{ vars.HK_NEWS_PROMPT_MACRO }}
+          HK_NEWS_PROMPT_STOCK: ${{ vars.HK_NEWS_PROMPT_STOCK }}
           FORCE_RUN: ${{ github.event.inputs.force_run }}
         run: python main.py
