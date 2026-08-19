@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 港股新聞監控系統 v2
-- GitHub Actions 長駐掃描 + gemini-3.6-flash 聯網 + 飛書卡片推送
+- GitHub Actions 長駐掃描 + gemini-2.5-flash 聯網 + 飛書卡片推送
 - 板塊消息每 session 首輪推送，後續只掃個股
 - 去重：個股按「代號+日期」，板塊按「主題關鍵詞+日期」
 - 所有格式規則由 GitHub Variables 嘅 prompt 控制
@@ -56,7 +56,7 @@ TIME_FORBIDDEN_WORDS = [
 # ============================================================
 DEFAULT_CONFIG = {
     "gemini": {
-        "model": "gemini-3.6-flash",
+        "model": "gemini-2.5-flash",
         "timeout_sec": 180,
         "max_retries": 3,
         "retry_wait_sec": 60,
