@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 港股新聞監控系統 v2
-- GitHub Actions 長駐掃描 + gemini-2.5-flash 聯網 + 飛書卡片推送
+- GitHub Actions 長駐掃描 + Gemini 2.5 Flash 聯網 + 飛書卡片推送
 - 板塊消息每 session 首輪推送，後續只掃個股
 - 去重：個股按「代號+日期」，板塊按「主題關鍵詞+日期」
 - 所有格式規則由 GitHub Variables 嘅 prompt 控制
@@ -500,16 +500,28 @@ SYSTEM_INSTRUCTION = (
 )
 
 
+_gemini_client = None
+
+
+def get_gemini_client(config):
+    """複用同一個 client，避免 chat 引用嘅 client 被 GC 關閉"""
+    global _gemini_client
+    if _gemini_client is None:
+        gcfg = config["gemini"]
+        _gemini_client = genai.Client(
+            api_key=os.getenv("GEMINI_API_KEY", ""),
+            http_options=types.HttpOptions(timeout=gcfg["timeout_sec"] * 1000),
+        )
+    return _gemini_client
+
+
 def gemini_call(prompt, config, chat=None):
     """調用 Gemini，返回 (text, grounding_urls, chat, quota_exhausted)。
     傳入 chat 可繼續同一對話（用於強制重試搜尋）。
     quota_exhausted=True 表示每日配額用盡，重試冇用。
     """
     gcfg = config["gemini"]
-    client = genai.Client(
-        api_key=os.getenv("GEMINI_API_KEY", ""),
-        http_options=types.HttpOptions(timeout=gcfg["timeout_sec"] * 1000),
-    )
+    client = get_gemini_client(config)
     gen_config = types.GenerateContentConfig(
         temperature=0.1,
         system_instruction=SYSTEM_INSTRUCTION,
