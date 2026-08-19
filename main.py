@@ -322,15 +322,23 @@ def save_cache(cache, config):
 
 
 def cleanup_cache(cache, config):
-    """清除過期記錄"""
+    """清除過期記錄。
+    stock key 格式係「CODE|YYYY-MM-DD」，要提取日期部分先比較；
+    macro key 直接係「YYYY-MM-DD」。
+    """
     expire_days = config["dedup"]["expire_days"]
     cutoff = (get_hkt_now() - timedelta(days=expire_days)).strftime("%Y-%m-%d")
     total_expired = 0
-    for section in ["stock", "macro"]:
-        expired = [k for k in cache[section] if k < cutoff]
-        for k in expired:
-            del cache[section][k]
-        total_expired += len(expired)
+    # stock: key = "01091.HK|2026-08-19"，提取 | 後面嘅日期
+    expired = [k for k in cache["stock"] if k.split("|")[-1] < cutoff]
+    for k in expired:
+        del cache["stock"][k]
+    total_expired += len(expired)
+    # macro: key = "2026-08-19"
+    expired = [k for k in cache["macro"] if k < cutoff]
+    for k in expired:
+        del cache["macro"][k]
+    total_expired += len(expired)
     if total_expired:
         print(f"🧹 清除 {total_expired} 條過期快取")
 
