@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 港股新聞監控系統 v2
-- GitHub Actions 長駐掃描 + gemini-2.0-flash 聯網 + 飛書卡片推送
+- GitHub Actions 長駐掃描 + Gemini 2.5 Flash 聯網 + 飛書卡片推送
 - 板塊消息每 session 首輪推送，後續只掃個股
 - 去重：個股按「代號+日期」，板塊按「主題關鍵詞+日期」
 - 所有格式規則由 GitHub Variables 嘅 prompt 控制
@@ -56,7 +56,7 @@ TIME_FORBIDDEN_WORDS = [
 # ============================================================
 DEFAULT_CONFIG = {
     "gemini": {
-        "model": "gemini-2.0-flash",
+        "model": "gemini-2.5-flash-lite",
         "timeout_sec": 180,
         "max_retries": 3,
         "retry_wait_sec": 60,
@@ -461,6 +461,13 @@ def is_retryable_error(e):
     ])
 
 
+def is_daily_quota_exhausted(e):
+    """檢查係咪每日配額用盡（429 RESOURCE_EXHAUSTED + quota 字樣）。
+    呢種情況重試冇用，要等到 quota 重置。"""
+    err = str(e).lower()
+    return "resource_exhausted" in err or "exceeded your current quota" in err
+
+
 def extract_grounding_urls(response):
     """提取 grounding metadata 嘅真實來源 URL"""
     urls = []
@@ -494,8 +501,9 @@ SYSTEM_INSTRUCTION = (
 
 
 def gemini_call(prompt, config, chat=None):
-    """調用 Gemini，返回 (text, grounding_urls, chat)。
+    """調用 Gemini，返回 (text, grounding_urls, chat, quota_exhausted)。
     傳入 chat 可繼續同一對話（用於強制重試搜尋）。
+    quota_exhausted=True 表示每日配額用盡，重試冇用。
     """
     gcfg = config["gemini"]
     client = genai.Client(
@@ -514,8 +522,12 @@ def gemini_call(prompt, config, chat=None):
                 chat = client.chats.create(model=gcfg["model"], config=gen_config)
             response = chat.send_message(prompt)
             grounding = extract_grounding_urls(response)
-            return response.text or "", grounding, chat
+            return response.text or "", grounding, chat, False
         except Exception as e:
+            # 每日配額用盡 → 唔好重試，直接返回
+            if is_daily_quota_exhausted(e):
+                print(f"🚫 Gemini 每日配額已用盡，唔再重試: {str(e)[:200]}")
+                return "", [], chat, True
             if is_retryable_error(e) and attempt < gcfg["max_retries"] - 1:
                 wait = gcfg["retry_wait_sec"] * (attempt + 1)
                 print(f"⚠️ Gemini 調用失敗，{wait}s 後重試 "
@@ -523,7 +535,7 @@ def gemini_call(prompt, config, chat=None):
                 time.sleep(wait)
             else:
                 print(f"❌ Gemini 調用最終失敗（已重試 {gcfg['max_retries']} 次）: {str(e)[:200]}")
-                return "", [], chat
+                return "", [], chat, False
 
 
 # ============================================================
@@ -627,7 +639,7 @@ def scan_once(session_name, turn_count, macro_pushed, config, prompts):
     """
     執行一次掃描
     prompts: (macro_prompt, stock_prompt)
-    返回 True 表示有推送
+    返回 True 表示有推送，False 表示無，"quota_exhausted" 表示配額用盡
     """
     macro_prompt, stock_prompt = prompts
     now_hkt = get_hkt_now()
@@ -672,7 +684,9 @@ def scan_once(session_name, turn_count, macro_pushed, config, prompts):
         print(f"📡 第 {turn_count} 輪掃描（只掃個股）")
 
     # 調用 Gemini
-    llm_result, grounding_urls, chat = gemini_call(prompt, config)
+    llm_result, grounding_urls, chat, quota_exhausted = gemini_call(prompt, config)
+    if quota_exhausted:
+        return "quota_exhausted"
     print(f"=== Gemini 回應 ({len(llm_result)} 字元) ===")
     print(llm_result[:2000])
     if len(llm_result) > 2000:
@@ -695,7 +709,9 @@ def scan_once(session_name, turn_count, macro_pushed, config, prompts):
             "4. site:cls.cn 港股 公告\n"
             "搜尋後根據真實結果，按照格式重新輸出。唔好再話無新聞，除非你真係搜過。"
         )
-        llm_result, grounding_urls, chat = gemini_call(followup, config, chat=chat)
+        llm_result, grounding_urls, chat, quota_exhausted = gemini_call(followup, config, chat=chat)
+        if quota_exhausted:
+            return "quota_exhausted"
         print(f"=== 追問回應 ({len(llm_result)} 字元) ===")
         print(llm_result[:2000])
         if len(llm_result) > 2000:
@@ -930,8 +946,11 @@ def main():
                 print(f"{'─' * 50}")
 
                 try:
-                    scan_once(session_name, turn, macro_pushed, config,
+                    result = scan_once(session_name, turn, macro_pushed, config,
                               (macro_prompt, stock_prompt))
+                    if result == "quota_exhausted":
+                        print("\n🚫 Gemini 每日配額已用盡，提早結束 session")
+                        break
                 except Exception as e:
                     print(f"❌ 本輪異常，跳過: {str(e)[:200]}")
 
