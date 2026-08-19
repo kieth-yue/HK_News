@@ -523,7 +523,7 @@ def gemini_call(prompt, config, chat=None):
     gcfg = config["gemini"]
     client = get_gemini_client(config)
     gen_config = types.GenerateContentConfig(
-        temperature=0.1,
+        temperature=0.2,
         system_instruction=SYSTEM_INSTRUCTION,
         tools=[types.Tool(google_search=types.GoogleSearch())],
     )
