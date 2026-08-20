@@ -56,7 +56,7 @@ TIME_FORBIDDEN_WORDS = [
 # ============================================================
 DEFAULT_CONFIG = {
     "gemini": {
-        "model": "gemini-2.5-flash",
+        "model": "gemini-1.5-flash",
         "timeout_sec": 180,
         "max_retries": 3,
         "retry_wait_sec": 60,
