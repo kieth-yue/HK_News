@@ -448,6 +448,7 @@ def gemini_call(prompt, config, chat=None):
         system_instruction=SYSTEM_INSTRUCTION,
         tools=[types.Tool(google_search=types.GoogleSearch())],
     )
+    quota_429_streak = 0  # 連續收到 quota 429 嘅次數
     for attempt in range(gcfg["max_retries"]):
         try:
             if chat is None:
@@ -456,10 +457,21 @@ def gemini_call(prompt, config, chat=None):
             grounding = extract_grounding_urls(response)
             return response.text or "", grounding, chat, False
         except Exception as e:
-            # 每日配額用盡 → 唔好重試，直接返回
             if is_daily_quota_exhausted(e):
-                print(f"🚫 Gemini 每日配額已用盡，唔再重試: {str(e)[:200]}")
-                return "", [], chat, True
+                quota_429_streak += 1
+                if quota_429_streak >= 2:
+                    # 連續 2 次都係 quota 429 → 真正 RPD 用盡
+                    print(f"🚫 Gemini 連續 {quota_429_streak} 次配額用盡，"
+                          f"確認 RPD 已用盡: {str(e)[:200]}")
+                    return "", [], chat, True
+                # 第一次 quota 429 → 可能係 RPM 限制，等 60 秒再試
+                wait = gcfg["retry_wait_sec"]
+                print(f"⚠️ Gemini 配額 429（第 {quota_429_streak} 次），"
+                      f"可能係 RPM 限制，{wait}s 後重試: {str(e)[:150]}")
+                time.sleep(wait)
+                continue
+            # 非配額錯誤 → 重置連續計數
+            quota_429_streak = 0
             if is_retryable_error(e) and attempt < gcfg["max_retries"] - 1:
                 wait = gcfg["retry_wait_sec"] * (attempt + 1)
                 print(f"⚠️ Gemini 調用失敗，{wait}s 後重試 "
@@ -468,6 +480,7 @@ def gemini_call(prompt, config, chat=None):
             else:
                 print(f"❌ Gemini 調用最終失敗（已重試 {gcfg['max_retries']} 次）: {str(e)[:200]}")
                 return "", [], chat, False
+    return "", [], chat, False
 # ============================================================
 # 新聞解析
 # ============================================================
