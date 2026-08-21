@@ -1,4 +1,4 @@
-name: HK News Monitor v2
+name: HK News Monitor
 
 on:
   schedule:
